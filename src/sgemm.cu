@@ -66,11 +66,11 @@ __global__ void gemm_device(
     Tensor cB = local_tile(idB, make_tile(Int<kTileN>{}, Int<kTileK>{}), make_coord(blockIdx.x, _));
     Tensor cC = local_tile(idC, make_tile(Int<kTileM>{}, Int<kTileN>{}), make_coord(blockIdx.y, blockIdx.x));
 
-    if (thread(0)) {
-        print("idA: ");print_tensor(idA);print("\n");
-        print("idB: ");print_tensor(idB);print("\n");
-        print("idC: ");print_tensor(idC);print("\n");
-    }
+    // if (thread(0)) {
+    //     print("idA: ");print_tensor(idA);print("\n");
+    //     print("idB: ");print_tensor(idB);print("\n");
+    //     print("idC: ");print_tensor(idC);print("\n");
+    // }
 
 
     using ABlockLayout = decltype(make_layout(make_shape(Int<kTileM>{}, Int<kTileK>{}))); // m-major, 即 stride m = 1, 即 col-major
@@ -124,9 +124,9 @@ __global__ void gemm_device(
         tBpB(i) = elem_less(tBcB(i), make_coord(N, K));
     }
 
-    if (thread(0)) {
-        print_tensor(tApA);print("\n");
-    }
+    // if (thread(0)) {
+    //     print_tensor(tApA);print("\n");
+    // }
 
     // kThrM = kTileM / 16, kThrN = kTileN / 16
     auto AThreadLayout = make_layout(make_shape(tC.shape<0>(), Int<1>{}));
