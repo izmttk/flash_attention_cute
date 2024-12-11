@@ -113,7 +113,6 @@ __global__ void gemm_device(
 
     using ABlockLayout = decltype(make_layout(make_shape(Int<kTileM>{}, Int<kTileK>{}))); // m-major, 即 stride m = 1, 即 col-major
     using BBlockLayout = decltype(make_layout(make_shape(Int<kTileN>{}, Int<kTileK>{}))); // n-major, 即 stride m = 1, 即 col-major
-    using CBlockLayout = decltype(make_layout(make_shape(Int<kTileM>{}, Int<kTileN>{}))); // m-major, 即 stride m = 1, 即 col-major
     
 
     // cosize 相当于 layout 最大映射到的 index + 1, 即 A(size(A)) + 1
@@ -122,7 +121,6 @@ __global__ void gemm_device(
 
     ABlockLayout sA_layout;
     BBlockLayout sB_layout;
-    CBlockLayout sC_layout;
 
     Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout);
     Tensor sB = make_tensor(make_smem_ptr(smemB), sB_layout);
@@ -341,8 +339,6 @@ int main() {
     cudaMalloc(&b_d, sizeof(float) * k * w);
     cudaMemcpy(a_d, a_h, sizeof(float) * h * k, cudaMemcpyHostToDevice);
     cudaMemcpy(b_d, b_h, sizeof(float) * k * w, cudaMemcpyHostToDevice);
-
-    auto cdiv = [](int a, int b) { return (a + b - 1) / b; };
 
     namespace chrono = std::chrono;
     chrono::time_point<chrono::high_resolution_clock> start, end;
