@@ -55,7 +55,8 @@ __global__ void gemm_device(
     //     print("gC: ");print_tensor(gC);print("\n");
     // }
     
-    // identity layout for gA, gB
+    // identity layout for mA, mB
+    // make_identity_tensor 产生的坐标 (i, j) 的元素值是 tuple(i, j)
     // ??? cute 3.5.0/3.5.1 在 windows 下编译会出错
     // make_identity_tensor 产生错误的结果，每个元素都是 (0, 44)，不明白为什么
     Tensor idA = make_identity_tensor(shape(mA));
@@ -91,9 +92,11 @@ __global__ void gemm_device(
     
     // tA 以 (32, 8) 和 col-major 的方式将坐标映射到线程的线性索引
     // 也就是决定了在这个范围内，线程对应哪些坐标的数据
+    // tA tB 用于读取 gA gB 的数据
     auto tA = make_layout(make_shape(Int<32>{}, Int<kTileK>{}));
     auto tB = make_layout(make_shape(Int<32>{}, Int<kTileK>{}));
     // 最终用于每个线程计算 8x8 的 partition
+    // tC 用于计算 gemm
     auto tC = make_layout(make_shape(Int<16>{}, Int<16>{}));
 
     // kThrM = kTileM / 32, kThrN = kTileN / 32, kThrK = kTileK / 8
@@ -112,9 +115,13 @@ __global__ void gemm_device(
     constexpr int kThrM = size<0>(tAgA);
     constexpr int kThrN = size<0>(tBgB);
     constexpr int kThrK = size<1>(tAgA);
+
     // predicate tensor
+    // 表示tAgA tBgB 中的数据是否越界，如果 tApA(i, j) 为 true, 则 tAgA(i, j) 是有效数据
     Tensor tApA = make_tensor<bool>(make_shape(Int<kThrM>{}, Int<kThrK>{}));
     Tensor tBpB = make_tensor<bool>(make_shape(Int<kThrN>{}, Int<kThrK>{}));
+
+    // 计算每个数据是否越界，elem_less 指 a tuple 中对应位置的元素都小于 b tuple 中对应位置的元素
     CUTE_UNROLL
     for (int i = 0; i < size(tApA); i++) {
         tApA(i) = elem_less(tAcA(i), make_coord(M, K));
@@ -129,6 +136,7 @@ __global__ void gemm_device(
     // }
 
     // kThrM = kTileM / 16, kThrN = kTileN / 16
+    // 这里列大小是 1 的原因是，使用 local_partition 后能够按完整一行分割 sA sB
     auto AThreadLayout = make_layout(make_shape(tC.shape<0>(), Int<1>{}));
     auto BThreadLayout = make_layout(make_shape(tC.shape<1>(), Int<1>{}));
     // 每个线程要读取的 sA sB 矩阵 partition, 以及写入的 sC 矩阵 partition
@@ -162,6 +170,7 @@ __global__ void gemm_device(
         gemm(tCsA, tCsB, tCrC);
         __syncthreads();
     }
+    // 写回结果
     CUTE_UNROLL
     for (int i = 0; i < size(tCrC); i++) {
         if (elem_less(tCcC(i), make_coord(M, N))) {
