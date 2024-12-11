@@ -96,6 +96,7 @@ __global__ void gemm_device(
     // make_identity_tensor 产生的坐标 (i, j) 的元素值是 tuple(i, j)
     // ??? cute 3.5.0/3.5.1 在 windows 下编译会出错
     // make_identity_tensor 产生错误的结果，每个元素都是 (0, 44)，不明白为什么
+    // NOTE: 需要添加 flag --expt-relaxed-constexpr
     Tensor idA = make_identity_tensor(shape(mA));
     Tensor idB = make_identity_tensor(shape(mB));
     Tensor idC = make_identity_tensor(shape(mC));
