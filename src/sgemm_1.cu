@@ -11,7 +11,6 @@ __host__ __device__ void my_print_layout(Layout const& layout)  // (m,n) -> idx
 //   CUTE_STATIC_ASSERT_V(rank(layout) == Int<2>{});
 
   int idx_width = num_digits(cosize(layout)) + 2;
-  const char* delim = "+-----------------------";
 
   print(layout); print("\n");
 
