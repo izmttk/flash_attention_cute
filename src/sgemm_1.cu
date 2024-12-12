@@ -226,10 +226,8 @@ __global__ void gemm_device(
         // 读取 A B 数据到 smem
         // copy(tAgA(_, _, k_tile), tAsA);
         // copy(tBgB(_, _, k_tile), tBsB);
-        // 这个实现每个线程处理 (4, 1) 个数据，因此不需要判断 K 维度是否越界
-        // 因此不需要重置 smem，因为 tCgC 在写入时还会进行一次 M N 越界判断
-        // clear(tAsA);
-        // clear(tBsB);
+        clear(tAsA);
+        clear(tBsB);
         copy_if(tApA, tAgA(_, _, k_tile), tAsA);
         copy_if(tBpB, tBgB(_, _, k_tile), tBsB);
         cp_async_fence();
