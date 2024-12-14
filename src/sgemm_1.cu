@@ -3,6 +3,7 @@
 #include <cute/tensor.hpp>
 #include <iostream>
 #include <chrono>
+#include <random>
 
 template <class Layout>
 __host__ __device__ void my_print_layout(Layout const& layout)  // (m,n) -> idx
@@ -65,6 +66,7 @@ __global__ void gemm_device(
     Tensor mA = make_tensor(make_gmem_ptr(Aptr), make_shape(M, K), make_stride(Int<1>{}, M));
     Tensor mB = make_tensor(make_gmem_ptr(Bptr), make_shape(N, K), make_stride(Int<1>{}, N));
     Tensor mC = make_tensor(make_gmem_ptr(Cptr), make_shape(M, N), make_stride(Int<1>{}, M));
+    
     // 如果是 GEMM TN, A 是 row-major, B 是 col-major, C 是 col-major
     // Tensor mA = make_tensor(make_gmem_ptr(Aptr), make_shape(K, M), make_stride(M, Int<1>{}));
     // Tensor mB = make_tensor(make_gmem_ptr(Bptr), make_shape(K, N), make_stride(N, Int<1>{}));
@@ -160,16 +162,6 @@ __global__ void gemm_device(
     Tensor tApA = make_tensor<bool>(make_shape(Int<kThrM>{}, Int<kThrK>{}));
     Tensor tBpB = make_tensor<bool>(make_shape(Int<kThrN>{}, Int<kThrK>{}));
 
-    // 计算每个数据是否越界，elem_less 指 a tuple 中对应位置的元素都小于 b tuple 中对应位置的元素
-    CUTE_UNROLL
-    for (int i = 0; i < size(tApA); i++) {
-        tApA(i) = elem_less(tAcA(i), make_coord(M, K));
-    }
-    CUTE_UNROLL
-    for (int i = 0; i < size(tBpB); i++) {
-        tBpB(i) = elem_less(tBcB(i), make_coord(N, K));
-    }
-
     // if (thread(0)) {
     //     print_tensor(tApA);print("\n");
     // }
@@ -226,6 +218,21 @@ __global__ void gemm_device(
         // 读取 A B 数据到 smem
         // copy(tAgA(_, _, k_tile), tAsA);
         // copy(tBgB(_, _, k_tile), tBsB);
+        // 计算每个数据是否越界，elem_less 指 a tuple 中对应位置的元素都小于 b tuple 中对应位置的元素
+        // 这样真的不会影响性能吗？？？
+        CUTE_UNROLL
+        for (int i = 0; i < size(tApA); i++) {
+            tApA(i) = elem_less(tAcA(_, _, k_tile)(i), make_coord(M, K));
+        }
+        CUTE_UNROLL
+        for (int i = 0; i < size(tBpB); i++) {
+            tBpB(i) = elem_less(tBcB(_, _, k_tile)(i), make_coord(N, K));
+        }
+        // if (thread(32)) {
+        //     print("k_tile: ");print(k_tile);print("\n");
+        //     print("tApA: ");print_tensor(tApA);print("\n");
+        //     print("tBpB: ");print_tensor(tBpB);print("\n");
+        // }
         clear(tAsA);
         clear(tBsB);
         copy_if(tApA, tAgA(_, _, k_tile), tAsA);
@@ -291,71 +298,121 @@ void launch_gemm(
     // print(id(5, 5));print("\n");
 }
 
+
+void gemm_host(
+    float *Aptr,
+    float *Bptr,
+    float *Cptr,
+    int M,
+    int N,
+    int K
+) {
+    // gemm nt, A(M, K) col-major, B(N, K) col-major, C(M, N) col-major
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float sum = 0;
+            for (int k = 0; k < K; k++) {
+                sum += Aptr[k * M + m] * Bptr[k * N + n];
+            }
+            Cptr[n * M + m] = sum;
+        }
+    }
+}
+
+
+float *generate_data(int n) {
+    auto seed = std::chrono::system_clock::now().time_since_epoch().count();
+    std::default_random_engine generator(seed);
+    auto distribution = std::uniform_real_distribution<float>(1.0, 10.0);
+    float *data = new float[n];
+    for (int i = 0; i < n; i++) {
+        data[i] = distribution(generator);
+    }
+    return data;
+}
+
 int main() {
-    const int h = 3, w=4, k=2;
-    float a[h][k] = {
-        {1, 2},
-        {3, 4},
-        {5, 6}
-    };
-    float b[k][w] = {
-        {1, 2, 3, 4},
-        {5, 6, 7, 8}
-    };
+    // const int h = 3, w = 4, k = 2;
+    // float a[h][k] = {
+    //     {1, 2},
+    //     {3, 4},
+    //     {5, 6}
+    // };
+    // float b[k][w] = {
+    //     {1, 2, 3, 4},
+    //     {5, 6, 7, 8}
+    // };
     // C = A * B
     // [11, 14, 17, 20]
     // [23, 30, 37, 44]
     // [35, 46, 57, 68]
 
-    // row-major to col-major
-    float *a_h = new float[h * k];
-    float *b_h = new float[w * k];
-    for (int i = 0; i < h; i++) {
-        for (int j = 0; j < k; j++) {
-            a_h[j * h + i] = a[i][j];
-        }
-    }
-    printf("a_h: ");
-    for (int i = 0; i < h * k; i++) {
-        printf("%f ", a_h[i]);
-    }
-    printf("\n");
-    for (int i = 0; i < k; i++) {
-        for (int j = 0; j < w; j++) {
-            b_h[i * w + j] = b[i][j];
-        }
-    }
-    printf("b_h: ");
-    for (int i = 0; i < w * k; i++) {
-        printf("%f ", b_h[i]);
-    }
-    printf("\n");
+    // // row-major to col-major
+    // float *a_h = new float[h * k];
+    // float *b_h = new float[w * k];
+    // for (int i = 0; i < h; i++) {
+    //     for (int j = 0; j < k; j++) {
+    //         a_h[j * h + i] = a[i][j];
+    //     }
+    // }
+    // printf("a_h: ");
+    // for (int i = 0; i < h * k; i++) {
+    //     printf("%f ", a_h[i]);
+    // }
+    // printf("\n");
+    // for (int i = 0; i < k; i++) {
+    //     for (int j = 0; j < w; j++) {
+    //         b_h[i * w + j] = b[i][j];
+    //     }
+    // }
+    // printf("b_h: ");
+    // for (int i = 0; i < w * k; i++) {
+    //     printf("%f ", b_h[i]);
+    // }
+    // printf("\n");
 
-    float *out_d, *out_h, *a_d, *b_d;
-    cudaMalloc(&out_d, sizeof(float) * h * w);
-    cudaMalloc(&a_d, sizeof(float) * h * k);
-    cudaMalloc(&b_d, sizeof(float) * k * w);
-    cudaMemcpy(a_d, a_h, sizeof(float) * h * k, cudaMemcpyHostToDevice);
-    cudaMemcpy(b_d, b_h, sizeof(float) * k * w, cudaMemcpyHostToDevice);
+
+
+    const int M = 2, N = 2, K = 17;
+    float *a_h = generate_data(M * K);
+    float *b_h = generate_data(K * N);
+
+    float *out_d, *a_d, *b_d;
+    cudaMalloc(&out_d, sizeof(float) * M * N);
+    cudaMalloc(&a_d, sizeof(float) * M * K);
+    cudaMalloc(&b_d, sizeof(float) * K * N);
+    cudaMemcpy(a_d, a_h, sizeof(float) * M * K, cudaMemcpyHostToDevice);
+    cudaMemcpy(b_d, b_h, sizeof(float) * K * N, cudaMemcpyHostToDevice);
 
     namespace chrono = std::chrono;
     chrono::time_point<chrono::high_resolution_clock> start, end;
     chrono::duration<double, std::milli> elapsed;
 
     start = chrono::high_resolution_clock::now();
-    launch_gemm(a_d, b_d, out_d, h, w, k);
+    launch_gemm(a_d, b_d, out_d, M, N, K);
     cudaDeviceSynchronize();
     end = chrono::high_resolution_clock::now();
     elapsed = end - start;
     std::cout << "Calculation time: " << elapsed.count() << " ms" << std::endl;
 
-    out_h = (float *)malloc(sizeof(float) * h * w);
-    cudaMemcpy(out_h, out_d, sizeof(float) * h * w, cudaMemcpyDeviceToHost);
+    float* out_h = (float *)malloc(sizeof(float) * M * N);
+    cudaMemcpy(out_h, out_d, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
+
+    float* out_hh = (float *)malloc(sizeof(float) * M * N);
+    gemm_host(a_h, b_h, out_hh, M, N, K);
 
     printf("out_h: \n");
-    for (int i = 0; i < h; i++) {
-        for (int j = 0; j < w; j++) {
-            printf("%f ", out_h[j * h + i]);
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            printf("%f ", out_h[j * M + i]);
+        }
+        printf("\n");
+    }
+
+    printf("out_hh: \n");
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            printf("%f ", out_hh[j * M + i]);
         }
         printf("\n");
     }
