@@ -12,6 +12,7 @@ set(INCLUDE_DIRS
 set(SOURCES
     src/flash_attention.cu
     src/sgemm_1.cu
+    src/sgemm_2.cu
 )
 
 
