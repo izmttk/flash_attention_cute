@@ -180,9 +180,9 @@ __global__ void gemm_device(
     // | LDG T1              | STS T1   |          | LDG T2              |          | STS T2   |          | LDG T3              | ...
     // +---------------------+----------+----------+----------+----------+----------+----------+----------+----------+----------+
     //                                  | LDS T1.1 | LDS T1.2 | LDS T1.3 | LDS T1.4 |          | LDS T2.1 | LDS T2.2 | LDS T2.3 |
-    //                                  +----------+----------+----------+----------+----------+----------+----------+----------+
-    //                                             | MMA T1.1 | MMA T1.2 | MMA T1.3 | MMA T1.4 |          | MMA T2.1 | MMA T2.2 |
-    //                                             +----------+----------+----------+----------+          +----------+----------+
+    //                                  +----------+----------+----------+----------+          +----------+----------+----------+
+    //                                             | MMA T1.1 | MMA T1.2 | MMA T1.3 |          | MMA T1.4 | MMA T2.1 | MMA T2.2 |
+    //                                             +----------+----------+----------+          +----------+----------+----------+
     //                                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^ 循环节
 
 
@@ -207,10 +207,12 @@ __global__ void gemm_device(
         for (int k_block = 0; k_block < K_BLOCK_MAX; k_block++) {
             // 如果是当前 tile 的最后一块，将保存全局内存数据的寄存器写回 smem
             if (k_block + 1 == K_BLOCK_MAX) {
-                __syncthreads();
-                copy(tArA, tAsA);
-                copy(tBrB, tBsB);
-                __syncthreads();
+                if (k_tile  < K_TILE_MAX - 1) {
+                    __syncthreads();
+                    copy(tArA, tAsA);
+                    copy(tBrB, tBsB);
+                    __syncthreads();
+                }
             }
             // 读取下一个块的数据到寄存器
             int k_block_next = (k_block + 1) % K_BLOCK_MAX;
@@ -218,7 +220,7 @@ __global__ void gemm_device(
             copy(tCsB(_, _, k_block_next), tCrB(_, _, k_block_next));
             // 如果是当前 tile 的第一块，开始下一个 tile 全局内存读取到寄存器
             if (k_block == 0) {
-                if (k_tile + 1 < K_TILE_MAX) {
+                if (k_tile  < K_TILE_MAX - 1) {
                     copy(copy_A, tAgA(_, _, _, k_tile + 1), tArA);
                     copy(copy_B, tBgB(_, _, _, k_tile + 1), tBrB);
                 }
