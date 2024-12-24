@@ -14,6 +14,7 @@ set(SOURCES
     src/sgemm_1.cu
     src/sgemm_2.cu
     src/sgemm_sm70_twostage.cu
+    src/sgemm_sm80_multistage.cu
 )
 
 
