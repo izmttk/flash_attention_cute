@@ -64,7 +64,6 @@ __global__ void gemm_device(
     Tensor mB = make_tensor(make_gmem_ptr(Bptr), make_shape(N, K), make_stride(Int<1>{}, N));
     Tensor mC = make_tensor(make_gmem_ptr(Cptr), make_shape(M, N), make_stride(Int<1>{}, M));
 
-
     // gA: (kTileM, kTileK, k) col-major
     // gB: (kTileN, kTileK, k) col-major
     // gC: (kTileM, kTileN) col-major
@@ -72,19 +71,14 @@ __global__ void gemm_device(
     Tensor gB = local_tile(mB, make_tile(Int<kTileN>{}, Int<kTileK>{}), make_coord(blockIdx.x, _));
     Tensor gC = local_tile(mC, make_tile(Int<kTileM>{}, Int<kTileN>{}), make_coord(blockIdx.y, blockIdx.x));
 
-    // if (thread(0)) {
-    //     print_tensor(gA(_, _, 0));
-    // }
-
     // predicate tensor, 元素值是坐标元组，用来检查 gmem 坐标是否越界
-    // Tensor idA = make_identity_tensor(shape(mA));
-    // Tensor idB = make_identity_tensor(shape(mB));
+    Tensor idA = make_identity_tensor(shape(mA));
+    Tensor idB = make_identity_tensor(shape(mB));
     Tensor idC = make_identity_tensor(shape(mC));
     // 对 idA idB 采取相同的切分方式
-    // Tensor cA = local_tile(idA, make_tile(Int<kTileM>{}, Int<kTileK>{}), make_coord(blockIdx.y, _));
-    // Tensor cB = local_tile(idB, make_tile(Int<kTileN>{}, Int<kTileK>{}), make_coord(blockIdx.x, _));
+    Tensor cA = local_tile(idA, make_tile(Int<kTileM>{}, Int<kTileK>{}), make_coord(blockIdx.y, _));
+    Tensor cB = local_tile(idB, make_tile(Int<kTileN>{}, Int<kTileK>{}), make_coord(blockIdx.x, _));
     Tensor cC = local_tile(idC, make_tile(Int<kTileM>{}, Int<kTileN>{}), make_coord(blockIdx.y, blockIdx.x));
-
 
     auto sA_layout = make_layout(make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStages>{})); // m-major, 即 stride m = 1, 即 col-major
     auto sB_layout = make_layout(make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStages>{})); // n-major, 即 stride m = 1, 即 col-major
@@ -111,8 +105,8 @@ __global__ void gemm_device(
     // TiledCopy 的分块坐标可能少于 gA|B 的维度，只分块前几个维度，后面维度尺寸会保持不变
     Tensor tAgA = thr_copy_A.partition_S(gA); // ((kThrM, kThrM), 1, 1, k) = ((4, 1), 1, 1, k)
     Tensor tAsA = thr_copy_A.partition_D(sA); // ((kThrN, kThrM), 1, 1, kStages)
-    // Tensor tAcA = thr_copy_A.partition_S(cA); // ((kThrM, kThrM), 1, 1, k)
-    // Tensor tApA = make_tensor_like<bool>(tAsA(0, _, _, 0));
+    Tensor tAcA = thr_copy_A.partition_S(cA); // ((kThrM, kThrM), 1, 1, k)
+    Tensor tApA = make_tensor_like<bool>(tAsA(0, _, _, 0));
 
     TiledCopy copy_B = make_tiled_copy(
         Copy_Atom<UniversalCopy<uint128_t>, float>{}, // copy_atom(copy_op, copy_type)
@@ -122,8 +116,8 @@ __global__ void gemm_device(
     ThrCopy thr_copy_B = copy_B.get_slice(threadIdx.x);
     Tensor tBgB = thr_copy_B.partition_S(gB); // ((kThrM, kThrM), 1, 1, k)
     Tensor tBsB = thr_copy_B.partition_D(sB); // ((kThrN, kThrM), 1, 1, kStages)
-    // Tensor tBcB = thr_copy_B.partition_S(cB); // ((kThrM, kThrM), 1, 1, k)
-    // Tensor tBpB = make_tensor_like<bool>(tBsB(0, _, _, 0));
+    Tensor tBcB = thr_copy_B.partition_S(cB); // ((kThrM, kThrM), 1, 1, k)
+    Tensor tBpB = make_tensor_like<bool>(tBsB(0, _, _, 0));
 
     // 1x1x1 FMA atom, repeat 16x16x1
     // TiledMMA 规定了执行一次 TiledMMA 操作处理的数据布局/规模，包括每个线程需要负责哪些数据
@@ -143,7 +137,7 @@ __global__ void gemm_device(
     // 每个线程需要在这些分块上重复计算，具体来说 sA|B(128, 8) 被分为 (8, 8) 块，gC(128, 128) 被分为 (8, 8) 块
     // 那么每个线程需要串行循环计算 8x8x8 个 MMA_Atom
     // partition_A|B|C 的结果是 ((单个MMA_Op消耗的数据布局...), 按 TiledMMA 将 sA|sB|gC 分块的坐标...)
-
+    
     Tensor tCsA = thr_mma.partition_A(sA); // (MMA, MMA_M, MMA_K)
     Tensor tCsB = thr_mma.partition_B(sB); // (MMA, MMA_N, MMA_K)
     Tensor tCgC = thr_mma.partition_C(gC); // (MMA, MMA_M, MMA_N)
@@ -185,18 +179,25 @@ __global__ void gemm_device(
     auto K_TILE_MAX = size<3>(tAgA);
 
     int k_tile_next = 0;
-
     // 在正式开始循环之前，启动前 kStages - 1 个 gmem to smem
     for (int k_pipe = 0; k_pipe < min(K_PIPE_MAX - 1, K_TILE_MAX); k_pipe++) {
-        copy(copy_A, tAgA(_, _, _, k_tile_next), tAsA(_, _, _, k_pipe));
-        copy(copy_B, tBgB(_, _, _, k_tile_next), tBsB(_, _, _, k_pipe));
+        CUTE_UNROLL
+        for (int i = 0; i < size(tApA); i++) {
+            tApA(i) = elem_less(tAcA(0, _, _, k_tile_next)(i), make_coord(M, K));
+        }
+        CUTE_UNROLL
+        for (int i = 0; i < size(tBpB); i++) {
+            tBpB(i) = elem_less(tBcB(0, _, _, k_tile_next)(i), make_coord(N, K));
+        }
+        clear(tAsA(_, _, _, k_pipe));
+        clear(tBsB(_, _, _, k_pipe));
+        copy_if(copy_A, tApA, tAgA(_, _, _, k_tile_next), tAsA(_, _, _, k_pipe));
+        copy_if(copy_B, tBpB, tBgB(_, _, _, k_tile_next), tBsB(_, _, _, k_pipe));
         cp_async_fence();
         k_tile_next++;
     }
 
-    
     clear(tCrC); // 放在这里是为了可以与上面的 copy 重叠
-
 
     int smem_pipe_read = 0; // 将要被读取的 smem 块
     int smem_pipe_write = K_PIPE_MAX - 1; // 将要被写入的 smem 块
@@ -247,8 +248,18 @@ __global__ void gemm_device(
             // 如果是当前 tile 的第一块，开始下一个 tile gmem 读取到 smem
             if (k_block == 0) {
                 if (k_tile_next < K_TILE_MAX) {
-                    copy(copy_A, tAgA(_, _, _, k_tile_next), tAsA(_, _, _, smem_pipe_write));
-                    copy(copy_B, tBgB(_, _, _, k_tile_next), tBsB(_, _, _, smem_pipe_write));
+                    CUTE_UNROLL
+                    for (int i = 0; i < size(tApA); i++) {
+                        tApA(i) = elem_less(tAcA(0, _, _, k_tile_next)(i), make_coord(M, K));
+                    }
+                    CUTE_UNROLL
+                    for (int i = 0; i < size(tBpB); i++) {
+                        tBpB(i) = elem_less(tBcB(0, _, _, k_tile_next)(i), make_coord(N, K));
+                    }
+                    clear(tAsA(_, _, _, smem_pipe_write));
+                    clear(tBsB(_, _, _, smem_pipe_write));
+                    copy_if(copy_A, tApA, tAgA(_, _, _, k_tile_next), tAsA(_, _, _, smem_pipe_write));
+                    copy_if(copy_B, tBpB, tBgB(_, _, _, k_tile_next), tBsB(_, _, _, smem_pipe_write));
                     cp_async_fence();
                 }
                 // 准备一下个 tile 的读取
@@ -326,7 +337,7 @@ float *generate_data(int n) {
 
 int main() {
     // 注意由于使用了向量化访存，数据应当对齐 16 字节，即 M 是 4 的倍数
-    const int M = 4, N = 4, K = 16;
+    const int M = 4, N = 4, K = 17;
     float *a_h = generate_data(M * K);
     float *b_h = generate_data(K * N);
 
