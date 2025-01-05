@@ -102,11 +102,12 @@ __global__ void gemm_device(
     ThrCopy thr_copy_A = copy_A.get_slice(threadIdx.x);
 
     // kThrM = 4, kThrN = 4, kThrK = 1
-    // partition_S|D 的结果是 ((ValLayout...), 按 TiledCopy 将 gA|B 分块的坐标...)
+    // partition_S|D 的结果是 ((CPY...), 按 TiledCopy 将 gA|B 分块的坐标...)
+    // CPY: (CopyAtomValLayout, ValLayout / CopyAtomValLayout)，即一个 ValLayout 的大小
     // TiledCopy 的分块坐标可能少于 gA|B 的维度，只分块前几个维度，后面维度尺寸会保持不变
-    Tensor tAgA = thr_copy_A.partition_S(gA); // ((kThrM, kThrM), 1, 1, k) = ((4, 1), 1, 1, k)
-    Tensor tAsA = thr_copy_A.partition_D(sA); // ((kThrN, kThrM), 1, 1)
-    Tensor tAcA = thr_copy_A.partition_S(cA); // ((kThrM, kThrM), 1, 1, k)
+    Tensor tAgA = thr_copy_A.partition_S(gA); // (CPY, 1, 1, k) = ((4, 1), 1, 1, k)
+    Tensor tAsA = thr_copy_A.partition_D(sA); // (CPY, 1, 1)
+    Tensor tAcA = thr_copy_A.partition_S(cA); // (CPY, 1, 1, k)
     Tensor tApA = make_tensor_like<bool>(tAsA(0, _, _));
 
 
@@ -116,9 +117,9 @@ __global__ void gemm_device(
         make_layout(make_shape(Int<4>{}, Int<1>{}))   // Value Layout (4, 1)
     );
     ThrCopy thr_copy_B = copy_B.get_slice(threadIdx.x);
-    Tensor tBgB = thr_copy_B.partition_S(gB); // ((kThrM, kThrM), 1, 1, k)
-    Tensor tBsB = thr_copy_B.partition_D(sB); // ((kThrN, kThrM), 1, 1)
-    Tensor tBcB = thr_copy_B.partition_S(cB); // ((kThrM, kThrM), 1, 1, k)
+    Tensor tBgB = thr_copy_B.partition_S(gB); // (CPY, 1, 1, k)
+    Tensor tBsB = thr_copy_B.partition_D(sB); // (CPY, 1, 1)
+    Tensor tBcB = thr_copy_B.partition_S(cB); // (CPY, 1, 1, k)
     Tensor tBpB = make_tensor_like<bool>(tBsB(0, _, _));
 
     // 1x1x1 FMA atom, repeat 16x16x1
