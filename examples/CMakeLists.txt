@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(flash_attention_cute VERSION 0.1.0 LANGUAGES CUDA CXX)
+project(cute_examples VERSION 0.1.0 LANGUAGES CUDA CXX)
 set(CMAKE_COLOR_DIAGNOSTICS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -10,8 +10,10 @@ set(INCLUDE_DIRS
     "${CMAKE_SOURCE_DIR}/include"
 )
 set(SOURCES
-    src/flash_attention.cu
-    src/flash_attention_api.cpp
+    sgemm_1.cu
+    sgemm_2.cu
+    sgemm_sm70_twostage.cu
+    sgemm_sm80_multistage.cu
 )
 
 
@@ -65,7 +67,3 @@ foreach(SOURCE ${SOURCES})
     #     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     # )
 endforeach()
-
-if (ENABLE_EXAMPLES)
-  add_subdirectory(examples)
-endif()

@@ -1,8 +1,8 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include "flash_attention.cuh"
 #include <cute/tensor.hpp>
-
 #define WARP_SIZE 32
 
 #include <cutlass/array.h>
@@ -19,13 +19,6 @@ __forceinline__ __device__ auto convert_type(cute::Tensor<Engine, Layout> const 
     return cute::make_tensor(cute::make_rmem_ptr<To_type>(&frag), tensor.layout());
 }
 
-struct AttentionFeatureDim {
-    int batch_size;
-    int num_heads;
-    int q_seqlen;
-    int kv_seqlen;
-    int headdim;
-};
 
 //  query: [batch_size, num_heads,  q_seqlen, qk_headdim]
 //    key: [batch_size, num_heads, kv_seqlen, qk_headdim]
@@ -35,15 +28,10 @@ struct AttentionFeatureDim {
 // rowmax: [batch_size, num_heads,  q_seqlen]
 // rowsum: [batch_size, num_heads,  q_seqlen]
 
-__global__ void flash_attention_v2(
-    cute::half_t* query,
-    cute::half_t* key,
-    cute::half_t* value,
-    cute::half_t* output,
-    AttentionFeatureDim dim,
-    float softmax_scale,
-    int head_stride
-) {
+// cuda 分配的内存默认 256 字节对齐，所以不需要担心指针不对齐向量访存大小的问题
+// 向量化访存 128bit 是沿着 head dim 方向进行的，所以只需要确保 head_dim 大小是 8 的倍数即可（对于半精度数据而言）
+// 同时在内存连续性上，只要求最后一维，即 head dim 连续即可，即 stride 为 1，其他的维度通过参数中的各自 stride 来控制
+__global__ void flash_attention_v2(FlashAttentionParams params) {
     using namespace cute;
 
     constexpr int kBlockM = 64; // Br
@@ -56,7 +44,26 @@ __global__ void flash_attention_v2(
     const int head = blockIdx.y;
     const int q_tile = blockIdx.x;
 
-    const int bs_head_offset = batch * head * head_stride;
+    Tensor mQ = make_tensor(
+        make_gmem_ptr(reinterpret_cast<half_t*>(params.q_ptr)),
+        make_shape(params.batch_size, params.num_heads, params.q_seqlen, params.headdim),
+        make_stride(params.q_batch_stride, params.q_head_stride, params.q_seqlen_stride, Int<1>{})
+    );
+    Tensor mK = make_tensor(
+        make_gmem_ptr(reinterpret_cast<half_t*>(params.k_ptr)),
+        make_shape(params.batch_size, params.num_heads, params.kv_seqlen, params.headdim),
+        make_stride(params.k_batch_stride, params.k_head_stride, params.k_seqlen_stride, Int<1>{})
+    );
+    Tensor mV = make_tensor(
+        make_gmem_ptr(reinterpret_cast<half_t*>(params.v_ptr)),
+        make_shape(params.batch_size, params.num_heads, params.kv_seqlen, params.headdim),
+        make_stride(params.v_batch_stride, params.v_head_stride, params.v_seqlen_stride, Int<1>{})
+    );
+    Tensor mO = make_tensor(
+        make_gmem_ptr(reinterpret_cast<half_t*>(params.o_ptr)),
+        make_shape(params.batch_size, params.num_heads, params.q_seqlen, params.headdim),
+        make_stride(params.o_batch_stride, params.o_head_stride, params.o_seqlen_stride, Int<1>{})
+    );
 
     // 1. gmem, smem Tensor 的定义，需要：
     // gmem global Tensor
@@ -64,29 +71,13 @@ __global__ void flash_attention_v2(
     // smem Tensor
 
     // Q: (q_seqlen, qk_headdim)
-    Tensor Q = make_tensor(
-        make_gmem_ptr(query + bs_head_offset), 
-        make_shape(dim.q_seqlen, Int<kHeadDim>{}),
-        make_stride(Int<kHeadDim>{}, Int<1>{}) // row-major
-    );
+    Tensor Q = mQ(batch, head, _, _);
     // K: (kv_seqlen, qk_headdim)
-    Tensor K = make_tensor(
-        make_gmem_ptr(key + bs_head_offset), 
-        make_shape(dim.kv_seqlen, Int<kHeadDim>{}),
-        make_stride(Int<kHeadDim>{}, Int<1>{})
-    );
+    Tensor K = mK(batch, head, _, _);
     // V: (kv_seqlen, v_headdim)
-    Tensor V = make_tensor(
-        make_gmem_ptr(value + bs_head_offset), 
-        make_shape(dim.kv_seqlen, Int<kHeadDim>{}),
-        make_stride(Int<kHeadDim>{}, Int<1>{})
-    );
+    Tensor V = mV(batch, head, _, _);
     // O: (q_seqlen, v_headdim)
-    Tensor O = make_tensor(
-        make_gmem_ptr(output + bs_head_offset), 
-        make_shape(dim.q_seqlen, Int<kHeadDim>{}),
-        make_stride(Int<kHeadDim>{}, Int<1>{})
-    );
+    Tensor O = mO(batch, head, _, _);
 
     // gQ 是固定的 Q 的第 q_tile 个分块
     // gQ: (kBlockM, qk_headdim, num_tile_qk_headdim) = (64, qk_headdim, 1)
@@ -217,7 +208,7 @@ __global__ void flash_attention_v2(
     fill(scores_max, -FLT_MAX);
     fill(scores_sum, 0.0f);
 
-    const int n_blocks = ceil_div(dim.kv_seqlen, kBlockN);
+    const int n_blocks = ceil_div(params.kv_seqlen, kBlockN);
     for (int block = 0; block < n_blocks; block++) {
         clear(rAccS);
 
@@ -286,7 +277,7 @@ __global__ void flash_attention_v2(
                 new_rowmax = max(new_rowmax, __shfl_xor_sync(0xffffffff, new_rowmax, offset));
             }
             // 因为求一行的最大值的时候，S没有进行缩放，所以这里要缩放一下
-            float scores_scale = expf((prev_rowmax - new_rowmax) * softmax_scale);
+            float scores_scale = expf((prev_rowmax - new_rowmax) * params.softmax_scale);
             prev_rowmax = new_rowmax;
 
             // 缩放 O
@@ -297,7 +288,7 @@ __global__ void flash_attention_v2(
 
             CUTE_UNROLL
             for (int col = 0; col < size<1>(rS_fp32); col++) {
-                rS_fp32(row, col) = expf((rS_fp32(row, col) - new_rowmax) * softmax_scale);
+                rS_fp32(row, col) = expf((rS_fp32(row, col) - new_rowmax) * params.softmax_scale);
             }
 
             float& prev_rowsum = scores_sum(row);
@@ -387,24 +378,13 @@ __global__ void flash_attention_v2(
 }
 
 
-void launch_flash_attention_v2(
-    cute::half_t* query,
-    cute::half_t* key,
-    cute::half_t* value,
-    cute::half_t* output,
-    AttentionFeatureDim dim,
-    float softmax_scale,
-    int head_stride
-) {
+void launch_flash_attention_v2(FlashAttentionParams params) {
     constexpr int kBlockM = 64; // Br
     constexpr int kNWarps = 4;
     constexpr int kNThreads = kNWarps * WARP_SIZE;
-    int num_q_tiles = cute::ceil_div(dim.q_seqlen, kBlockM);
-    dim3 grid(num_q_tiles, dim.num_heads, dim.batch_size);
+    int num_q_tiles = cute::ceil_div(params.q_seqlen, kBlockM);
+    dim3 grid(num_q_tiles, params.num_heads, params.batch_size);
     dim3 block(kNThreads);
-    flash_attention_v2<<<grid, block>>>(query, key, value, output, dim, softmax_scale, head_stride);
-}
-
-int main() {
-    return 0;
+    flash_attention_v2<<<grid, block>>>(params);
+    CUDA_ERROR_CHECK(cudaGetLastError());
 }
