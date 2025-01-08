@@ -61,11 +61,13 @@ def sdpa(query, key, value, scale=None, mask=None):
     return attn.half()
 
 def mse(a, b):
+    a = a.float()
+    b = b.float()
     return torch.mean((a - b) ** 2)
 
-def benchmark():
-    bs = 1
-    num_heads = 4
+def benchmark(iter = 100):
+    bs = 2
+    num_heads = 16
     seq_len = 512
     dim = 128
     q = torch.randn((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
@@ -97,11 +99,27 @@ def benchmark():
     print("O shape(cpp):", o_cpp.shape)
     o_py = sdpa(q, k, v, scale=scale)
     print("O shape(py):", o_py.shape)
-    print(mse(o_cpp, o_py).item())
-    print(torch.allclose(o_cpp, o_py, atol=1e-3))
+    print("MSE:", mse(o_cpp, o_py).item())
+    print("Allclose:", torch.allclose(o_cpp, o_py, atol=1e-3))
 
-    print(o_cpp)
-    print(o_py)
+    # print(o_cpp)
+    # print(o_py)
+
+    start = time.time()
+    for _ in range(iter):
+        o_cpp = flash_attention_ext.flash_attention_v2_cute(q, k, v, scale)
+    end = time.time()
+    elapsed = (end - start) * 1e3
+    print(f"Elapsed time (cpp): {elapsed:.3f} ms")
+    print(f"Time per iteration (cpp): {elapsed / iter:.3f} ms")
+
+    start = time.time()
+    for _ in range(iter):
+        o_py = sdpa(q, k, v, scale=scale)
+    end = time.time()
+    elapsed = (end - start) * 1e3
+    print(f"Elapsed time (py): {elapsed:.3f} ms")
+    print(f"Time per iteration (py): {elapsed / iter:.3f} ms")
 
 if __name__ == "__main__":
     benchmark()
