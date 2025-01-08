@@ -82,7 +82,6 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     // gQ 是固定的 Q 的第 q_tile 个分块
     // gQ: (kBlockM, qk_headdim, num_tile_qk_headdim) = (64, qk_headdim, 1)
     Tensor gQ = local_tile(Q, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(q_tile, _));
-
     // gK, gV 会在 tile 迭代时更新，这里预取第一个 Q、K tile
     // gK: (kBlockN, qk_headdim, num_tile_qk_headdim) = (64, qk_headdim, 1)
     Tensor gK = local_tile(K, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _));
@@ -108,7 +107,6 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     Tensor sVt = make_tensor(make_smem_ptr(v_smem), SmemLayoutVt{});
     // 复用 sQ 的存储
     Tensor sO = make_tensor(sQ.data(), SmemLayoutO{});
-
 
     // 2. gmem to smem 的定义，需要：
     // 单线程负责的 gmem tiled Tensor
@@ -250,18 +248,24 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
         }
 
         // softmax
-        // tSrS: (MMA, MMA_M, MMA_N) = ((2, 2), 1, 8)
+        // rAccS: (MMA, MMA_M, MMA_N) = ((2, 2), 1, 8)
         // scores: (2, 16)
         // 就是把 tSrS 重新视为二维矩阵
         // 有办法直接获得一个线程处理矩阵的行数吗？现在是根据 SM80_16x8x16_F32F16F16F32_TN 的 LayoutC_TV 看出来一个线程 2 行
-        Tensor rS_fp32 = make_tensor(rAccS.data(), make_shape(
-            Int<get<0>(shape<0>(rAccS)) * shape<1>(rAccS)>{},
-            Int<get<1>(shape<0>(rAccS)) * shape<2>(rAccS)>{}
-        ));
-        Tensor rO_fp32 = make_tensor(rAccO.data(), make_shape(
-            Int<get<0>(shape<0>(rAccO)) * shape<1>(rAccO)>{},
-            Int<get<1>(shape<0>(rAccO)) * shape<2>(rAccO)>{}
-        ));
+        //
+        // rAccS layout from:                                   to:
+        // V0 V2 V0 V2 V0 V2 V0 V2 V0 V2 V0 V2 V0 V2 V0 V2      V0 V1 V0 V1 V0 V1 V0 V1 V0 V1 V0 V1 V0 V1 V0 V1
+        // V1 V3 V1 V3 V1 V3 V1 V3 V1 V3 V1 V3 V1 V3 V1 V3      V2 V3 V2 V3 V2 V3 V2 V3 V2 V3 V2 V3 V2 V3 V2 V3
+        //
+        // 一个 mma atom 消耗 V0 V1 V2 V3 4 个值，其中 V0 V1 为一行，V2 V3 为一行
+        // 但是在 rAccS 的 第一个维度上，布局是 col-major 的，我们把它转换为 row-major，更符合直觉方便后续按行遍历，也就是：
+        // from col-major: V0 V3    to row-major: V0 V1
+        //                 V1 V2                  V2 V3
+        // 注意这里仅重新将值按照新布局解释，即更改了遍历顺序，并不涉及数据移动
+        auto flat2d_layoutS = zipped_divide(layout(rAccS), Tile<Layout<Shape<_2>, Stride<_2>>>{});
+        Tensor rS_fp32 = make_tensor(rAccS.data(), flat2d_layoutS);
+        auto flat2d_layoutO = zipped_divide(layout(rAccO), Tile<Layout<Shape<_2>, Stride<_2>>>{});
+        Tensor rO_fp32 = make_tensor(rAccO.data(), flat2d_layoutO);
 
         CUTE_UNROLL
         for (int row = 0; row < size<0>(rS_fp32); row++) {
@@ -310,16 +314,16 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
         // layout C:((2, 2), MMA_M, MMA_N) -> layout A:((2, 2, 2), MMA_M, MMA_N / 2)
         // 即 ((2, 2), 1, 8) -> ((2, 2, 2), 1, 4)
         // ((2, 2), 1, 8)
-        auto scores_layoutC = layout(rAccS);
+        auto mmaC_layoutP = layout(rAccS);
         // ((2, 2), 1, (2, 4))
-        auto scores_layoutC_N_div_2 = logical_divide(scores_layoutC, make_shape(_, _, Int<2>{}));
+        auto mmaC_split_layoutP = logical_divide(mmaC_layoutP, make_shape(_, _, Int<2>{}));
         // ((2, 2, 2), 1, 4)
-        auto scores_layoutA = make_layout(
-            append(get<0>(scores_layoutC_N_div_2), get<0>(get<2>(scores_layoutC_N_div_2))),
-            get<1>(scores_layoutC_N_div_2),
-            get<1>(get<2>(scores_layoutC_N_div_2))
+        auto mmaA_layoutP = make_layout(
+            append(get<0>(mmaC_split_layoutP), get<0>(get<2>(mmaC_split_layoutP))),
+            get<1>(mmaC_split_layoutP),
+            get<1>(get<2>(mmaC_split_layoutP))
         );
-        Tensor tOrP = make_tensor(rP.data(), scores_layoutA);
+        Tensor tOrP = make_tensor(rP.data(), mmaA_layoutP);
         // tOrVt 用 mma atom 进行 partition
         // tOsVt 用 copy atom 进行 partition
         // 这两个 atom 的 value layout 可能不同，用 retile 按照 copy atom 的划分模式重新划分
@@ -336,10 +340,8 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
             gemm(tiled_mma, tOrP(_, _, sub_block), tOrVt(_, _, sub_block), rAccO);
         }
     }
-    Tensor rO_fp32 = make_tensor(rAccO.data(), make_shape(
-        Int<get<0>(shape<0>(rAccO)) * shape<1>(rAccO)>{},
-        Int<get<1>(shape<0>(rAccO)) * shape<2>(rAccO)>{}
-    ));
+    auto flat2d_layoutO = zipped_divide(layout(rAccO), Tile<Layout<Shape<_2>, Stride<_2>>>{});
+    Tensor rO_fp32 = make_tensor(rAccO.data(), flat2d_layoutO);
     CUTE_UNROLL
     for (int row = 0; row < size<0>(rO_fp32); row++) {
         float scale = 1 / scores_sum(row);

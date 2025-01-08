@@ -36,6 +36,16 @@ flash_attention_ext = load(
 )
 
 
+def select_reg_SM80_16x8x16_F16F16F16F16_TN(Q):
+    n_atoms = Q.size(-1) // 8
+    reg = torch.zeros((2, n_atoms * 2), device="cuda")
+    for i in range(n_atoms):
+        reg[0, i*2] = Q[0, 0, 0, i*8]
+        reg[0, i*2+1] = Q[0, 0, 0, i*8 + 1]
+        reg[1, i*2] = Q[0, 0, 8, i*8]
+        reg[1, i*2+1] = Q[0, 0, 8, i*8 + 1]
+    return reg
+
 def sdpa(query, key, value, scale=None, mask=None):
     # query: [batch_size, n_heads, seq_len, d_k]
     query = query.float()
@@ -47,6 +57,7 @@ def sdpa(query, key, value, scale=None, mask=None):
         scores = scores.masked_fill(mask == 0, float('-inf'))
     attn = torch.softmax(scores, dim=-1)
     attn = torch.matmul(attn, value)
+    # print(select_reg_SM80_16x8x16_F16F16F16F16_TN(attn))
     return attn.half()
 
 def mse(a, b):
@@ -54,18 +65,28 @@ def mse(a, b):
 
 def benchmark():
     bs = 1
-    num_heads = 1
-    seq_len = 64
+    num_heads = 4
+    seq_len = 512
     dim = 128
-    # q = torch.randn((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
-    # k = torch.randn((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
-    # v = torch.randn((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
-    q = torch.arange(0, bs * num_heads * seq_len * dim, dtype=torch.half, device="cuda").reshape(bs, num_heads, seq_len, dim)
-    k = torch.arange(0, bs * num_heads * seq_len * dim, dtype=torch.half, device="cuda").reshape(bs, num_heads, seq_len, dim)
-    v = torch.arange(0, bs * num_heads * seq_len * dim, dtype=torch.half, device="cuda").reshape(bs, num_heads, seq_len, dim)
+    q = torch.randn((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
+    k = torch.randn((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
+    v = torch.randn((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
+    # q = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
+    # k = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
+    # v = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
+    # for i in range(v.size(-1)):
+    #     v[:, :, :, i] = i
+    # q = torch.arange(0, bs * num_heads * seq_len * dim, dtype=torch.half, device="cuda").reshape(bs, num_heads, seq_len, dim)
+    # k = torch.arange(0, bs * num_heads * seq_len * dim, dtype=torch.half, device="cuda").reshape(bs, num_heads, seq_len, dim)
+    # v = torch.arange(0, bs * num_heads * seq_len * dim, dtype=torch.half, device="cuda").reshape(bs, num_heads, seq_len, dim)
     # q = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
     # k = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda") * 2
     # v = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda") * 3
+
+    # print(torch.matmul(q.float(), k.transpose(-2, -1).float())[0, 0, 0, :2])
+    print("Q stride:", q.stride())
+    print("K stride:", k.stride())
+    print("V stride:", v.stride())
 
     print("Benchmarking...")
     print("Q shape:", q.shape)
