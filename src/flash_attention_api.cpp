@@ -7,6 +7,40 @@
 torch::Tensor flash_attention_v2_cute(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, float softmax_scale) {
 
+    // Check input shape
+    TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0),
+                "q, k, v must have the same batch size");
+    TORCH_CHECK(q.size(1) == k.size(1) && q.size(1) == v.size(1),
+                "q, k, v must have the same number of heads");
+    TORCH_CHECK(k.size(2) == v.size(2),
+                "k, v must have the same sequence length");
+    TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3),
+                "q, k, v must have the same hidden dimension");
+    TORCH_CHECK(q.size(0) > 0 && q.size(1) > 0 && q.size(2) > 0 && q.size(3) > 0,
+                "q, k, v must have at least one element");
+
+    // Check input data type
+    TORCH_CHECK(q.dtype() == k.dtype() && q.dtype() == v.dtype(),
+                "q, k, v must have the same data type");
+    TORCH_CHECK(q.dtype() == torch::kHalf,
+                "q, k, v only support fp16 data type");
+
+    // Check input memory contiguity
+    TORCH_CHECK(q.stride(3) == 1,
+                "q must be contiguous in the last dimension");
+    TORCH_CHECK(k.stride(3) == 1,
+                "k must be contiguous in the last dimension");
+    TORCH_CHECK(v.stride(3) == 1,
+                "v must be contiguous in the last dimension");
+
+    // Check kernel constraints
+    TORCH_CHECK(q.size(3) % 8 == 0,
+                "hidden dimension must be multiple of 8");
+    TORCH_CHECK(q.size(3) <= 128,
+                "only support hidden dimension <= 128");
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
+                "q, k, v must be on CUDA device");
+
     int bs = q.size(0);
     int head = q.size(1);
     int q_seqlen = q.size(2);
