@@ -135,6 +135,7 @@ def benchmark(iter = 100):
     start = time.time()
     for _ in range(iter):
         o_cpp = flash_attn(q, k, v)
+    torch.cuda.synchronize()
     end = time.time()
     elapsed = (end - start) * 1e3
     print(f"Elapsed time (cpp): {elapsed:.3f} ms")
@@ -143,6 +144,7 @@ def benchmark(iter = 100):
     start = time.time()
     for _ in range(iter):
         o_py = sdpa(q, k, v)
+    torch.cuda.synchronize()
     end = time.time()
     elapsed = (end - start) * 1e3
     print(f"Elapsed time (py): {elapsed:.3f} ms")
