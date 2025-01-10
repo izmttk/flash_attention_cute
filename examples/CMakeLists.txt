@@ -16,6 +16,11 @@ set(SOURCES
     sgemm_sm80_multistage.cu
 )
 
+set(DEFS
+    -D__CUDA_NO_HALF_OPERATORS__
+    -D__CUDA_NO_HALF_CONVERSIONS__
+    -D__CUDA_NO_HALF2_OPERATORS__
+)
 
 set(CMAKE_CXX_STANDARD ${STANDARD})
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -51,6 +56,7 @@ foreach(SOURCE ${SOURCES})
     add_executable(${SOURCE_NAME} ${SOURCE})
     target_compile_options(${SOURCE_NAME} PRIVATE -lineinfo -expt-relaxed-constexpr)
     target_include_directories(${SOURCE_NAME} PRIVATE ${INCLUDE_DIRS})
+    target_compile_definitions(${SOURCE_NAME} PRIVATE ${DEFS})
 
     target_link_libraries(${SOURCE_NAME} ${TORCH_LIBRARIES} Python::Python)
     target_include_directories(${SOURCE_NAME} PRIVATE ${TORCH_INCLUDE_DIRS})

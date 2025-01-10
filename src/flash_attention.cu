@@ -18,7 +18,45 @@ __forceinline__ __device__ auto convert_type(cute::Tensor<Engine, Layout> const 
     auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
     return cute::make_tensor(cute::make_rmem_ptr<To_type>(&frag), tensor.layout());
 }
+// #include <cuda_fp16.h>
+// template <typename STensor>
+// __forceinline__ __device__ auto convert_type_f322f16(STensor const &acc_fp32) {
+//     using namespace cute;
+//     auto acc_fp16 = make_tensor_like<half_t>(acc_fp32);
+//     {
+//         auto acc_fp32x2 = recast<float2>(acc_fp32);
+//         auto acc_fp16x2 = recast<half2>(acc_fp16);
+//         CUTE_UNROLL
+//         for (int i = 0; i < size(acc_fp32x2); ++i) { acc_fp16x2(i) = __float22half2_rn(acc_fp32x2(i)); }
+//     }
+//     return acc_fp16;
+// }
 
+template <class TiledCopy, class IdentityTensor, class MaxMN, class  STensor, class DTensor>
+__forceinline__ __device__ void copy(
+    TiledCopy const& tiled_copy,
+    IdentityTensor const& identity, // (CPY, CPY_M, CPY_N)
+    MaxMN const& max_mn,            // (MAX_M, MAX_N)
+    STensor const& src,             // (CPY, CPY_M, CPY_N)
+    DTensor& dst                    // (CPY, CPY_M, CPY_N)
+) {
+    using namespace cute;
+    CUTE_UNROLL
+    for (int m = 0; m < size<1>(src); m++) {
+        if (get<0>(identity(0, m, 0)) < get<0>(max_mn)) {
+            CUTE_UNROLL
+            for (int n = 0; n < size<2>(src); n++) {
+                if (get<1>(identity(0, m, n)) < get<1>(max_mn)) {
+                    copy(tiled_copy, src(_, m, n), dst(_, m, n));
+                } else {
+                    clear(dst(_, m, n));
+                }
+            }
+        } else {
+            clear(dst(_, m, _));
+        }
+    }
+}
 
 //  query: [batch_size, num_heads,  q_seqlen, qk_headdim]
 //    key: [batch_size, num_heads, kv_seqlen, qk_headdim]
@@ -44,51 +82,61 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     const int head = blockIdx.y;
     const int q_tile = blockIdx.x;
 
-    Tensor mQ = make_tensor(
-        make_gmem_ptr(reinterpret_cast<half_t*>(params.q_ptr)),
-        make_shape(params.batch_size, params.num_heads, params.q_seqlen, params.headdim),
-        make_stride(params.q_batch_stride, params.q_head_stride, params.q_seqlen_stride, Int<1>{})
-    );
-    Tensor mK = make_tensor(
-        make_gmem_ptr(reinterpret_cast<half_t*>(params.k_ptr)),
-        make_shape(params.batch_size, params.num_heads, params.kv_seqlen, params.headdim),
-        make_stride(params.k_batch_stride, params.k_head_stride, params.k_seqlen_stride, Int<1>{})
-    );
-    Tensor mV = make_tensor(
-        make_gmem_ptr(reinterpret_cast<half_t*>(params.v_ptr)),
-        make_shape(params.batch_size, params.num_heads, params.kv_seqlen, params.headdim),
-        make_stride(params.v_batch_stride, params.v_head_stride, params.v_seqlen_stride, Int<1>{})
-    );
-    Tensor mO = make_tensor(
-        make_gmem_ptr(reinterpret_cast<half_t*>(params.o_ptr)),
-        make_shape(params.batch_size, params.num_heads, params.q_seqlen, params.headdim),
-        make_stride(params.o_batch_stride, params.o_head_stride, params.o_seqlen_stride, Int<1>{})
-    );
+    // Tensor mQ = make_tensor(
+    //     make_gmem_ptr(reinterpret_cast<half_t*>(params.q_ptr)),
+    //     make_shape(params.batch_size, params.num_heads, params.q_seqlen, params.headdim),
+    //     make_stride(params.q_batch_stride, params.q_head_stride, params.q_seqlen_stride, Int<1>{})
+    // );
+    // Tensor mK = make_tensor(
+    //     make_gmem_ptr(reinterpret_cast<half_t*>(params.k_ptr)),
+    //     make_shape(params.batch_size, params.num_heads, params.kv_seqlen, params.headdim),
+    //     make_stride(params.k_batch_stride, params.k_head_stride, params.k_seqlen_stride, Int<1>{})
+    // );
+    // Tensor mV = make_tensor(
+    //     make_gmem_ptr(reinterpret_cast<half_t*>(params.v_ptr)),
+    //     make_shape(params.batch_size, params.num_heads, params.kv_seqlen, params.headdim),
+    //     make_stride(params.v_batch_stride, params.v_head_stride, params.v_seqlen_stride, Int<1>{})
+    // );
+    // Tensor mO = make_tensor(
+    //     make_gmem_ptr(reinterpret_cast<half_t*>(params.o_ptr)),
+    //     make_shape(params.batch_size, params.num_heads, params.q_seqlen, params.headdim),
+    //     make_stride(params.o_batch_stride, params.o_head_stride, params.o_seqlen_stride, Int<1>{})
+    // );
 
-    // 1. gmem, smem Tensor 的定义，需要：
-    // gmem global Tensor
-    // gmem tiled Tensor
-    // smem Tensor
+    // // 1. gmem, smem Tensor 的定义，需要：
+    // // gmem global Tensor
+    // // gmem tiled Tensor
+    // // smem Tensor
 
-    // Q: (q_seqlen, qk_headdim)
-    Tensor Q = mQ(batch, head, _, _);
-    // K: (kv_seqlen, qk_headdim)
-    Tensor K = mK(batch, head, _, _);
-    // V: (kv_seqlen, v_headdim)
-    Tensor V = mV(batch, head, _, _);
-    // O: (q_seqlen, v_headdim)
-    Tensor O = mO(batch, head, _, _);
+    // // Q: (q_seqlen, qk_headdim)
+    // Tensor Q = mQ(batch, head, _, _);
+    // // K: (kv_seqlen, qk_headdim)
+    // Tensor K = mK(batch, head, _, _);
+    // // V: (kv_seqlen, v_headdim)
+    // Tensor V = mV(batch, head, _, _);
+    // // O: (q_seqlen, v_headdim)
+    // Tensor O = mO(batch, head, _, _);
+
+    half_t *q_offset = reinterpret_cast<half_t*>(params.q_ptr) + batch * params.q_batch_stride + head * params.q_head_stride;
+    half_t *k_offset = reinterpret_cast<half_t*>(params.k_ptr) + batch * params.k_batch_stride + head * params.k_head_stride;
+    half_t *v_offset = reinterpret_cast<half_t*>(params.v_ptr) + batch * params.v_batch_stride + head * params.v_head_stride;
+    half_t *o_offset = reinterpret_cast<half_t*>(params.o_ptr) + batch * params.o_batch_stride + head * params.o_head_stride;
+
+    Tensor mQ = make_tensor(make_gmem_ptr(q_offset), make_layout(make_shape(params.q_seqlen, params.headdim), make_stride(params.q_seqlen_stride, Int<1>{})));
+    Tensor mK = make_tensor(make_gmem_ptr(k_offset), make_layout(make_shape(params.kv_seqlen, params.headdim), make_stride(params.k_seqlen_stride, Int<1>{})));
+    Tensor mV = make_tensor(make_gmem_ptr(v_offset), make_layout(make_shape(params.kv_seqlen, params.headdim), make_stride(params.v_seqlen_stride, Int<1>{})));
+    Tensor mO = make_tensor(make_gmem_ptr(o_offset), make_layout(make_shape(params.q_seqlen, params.headdim), make_stride(params.o_seqlen_stride, Int<1>{})));
 
     // gQ 是固定的 Q 的第 q_tile 个分块
     // gQ: (kBlockM, qk_headdim, num_tile_qk_headdim) = (64, qk_headdim, 1)
-    Tensor gQ = local_tile(Q, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(q_tile, _));
+    Tensor gQ = local_tile(mQ, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(q_tile, _));
     // gK, gV 会在 tile 迭代时更新，这里预取第一个 Q、K tile
     // gK: (kBlockN, qk_headdim, num_tile_qk_headdim) = (64, qk_headdim, 1)
-    Tensor gK = local_tile(K, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _));
+    Tensor gK = local_tile(mK, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _));
     // gV: (kBlockN, v_headdim, num_tile_v_headdim) = (64, v_headdim, 1)
-    Tensor gV = local_tile(V, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _));
+    Tensor gV = local_tile(mV, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _));
     // gO: (kBlockM, v_headdim, num_tile_v_headdim) = (64, v_headdim, 1)
-    Tensor gO = local_tile(O, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(q_tile, _));
+    Tensor gO = local_tile(mO, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(q_tile, _));
 
     // TODO: 需要 Swizzle 优化
     using SmemLayoutQ = decltype(make_layout(make_shape(Int<kBlockM>{}, Int<kHeadDim>{}), make_stride(Int<kHeadDim>{}, Int<1>{})));
@@ -107,6 +155,9 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     Tensor sVt = make_tensor(make_smem_ptr(v_smem), SmemLayoutVt{});
     // 复用 sQ 的存储
     Tensor sO = make_tensor(sQ.data(), SmemLayoutO{});
+
+    Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));
+    Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));
 
     // 2. gmem to smem 的定义，需要：
     // 单线程负责的 gmem tiled Tensor
@@ -127,6 +178,9 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
     Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
     Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
+
+    Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);
+    Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);
 
     // 3. smem to reg 的定义，需要：
     // 单线程负责的 smem tiled Tensor
@@ -187,13 +241,13 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     );
     ThrCopy smem_thr_copy_V = smem_tiled_copy_V.get_slice(threadIdx.x);
     Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
-    
-    copy(gmem_tiled_copy_QKV, tQgQ, tQsQ);
+
+    copy(gmem_tiled_copy_QKV, tQcQ, make_tuple(params.q_seqlen - q_tile * kBlockM, params.headdim), tQgQ, tQsQ);
     cp_async_fence();
     cp_async_wait<0>();
     __syncthreads();
 
-    copy(gmem_tiled_copy_QKV, tKgK, tKsK);
+    copy(gmem_tiled_copy_QKV, tKVcKV, make_tuple(params.kv_seqlen - 0 * kBlockN, params.headdim), tKgK, tKsK);
     cp_async_fence();
 
     clear(rAccO);
@@ -216,9 +270,11 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
         __syncthreads();
 
         // 复制接下来将要用到的 V 到 smem
-        gV = local_tile(V, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(block, _));
+        gV = local_tile(mV, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(block, _));
         tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
-        copy(gmem_tiled_copy_QKV, tVgV, tVsV);
+
+        copy(gmem_tiled_copy_QKV, tKVcKV, make_tuple(params.kv_seqlen - block * kBlockN, params.headdim), tVgV, tVsV);
+
         cp_async_fence();
 
         // S = Q * K^T
@@ -241,10 +297,30 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
         // 复制下一个 block 的 K 到 smem
         if (block != n_blocks - 1) {
             // 更新 gK tKgK 指向下一个 K block，并进行复制
-            gK = local_tile(K, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(block + 1, _));
+            gK = local_tile(mK, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(block + 1, _));
             tKgK = gmem_thr_copy_QKV.partition_S(gK(_, _, 0));
-            copy(gmem_tiled_copy_QKV, tKgK, tKsK);
+
+            copy(gmem_tiled_copy_QKV, tKVcKV, make_tuple(params.kv_seqlen - (block + 1) * kBlockN, params.headdim), tKgK, tKsK);
             cp_async_fence();
+        }
+
+        // mask rAccS，越界的值置为 -FLT_MAX
+        CUTE_UNROLL
+        for (int mi = 0; mi < size<0, 1>(rAccS); mi++) {
+            CUTE_UNROLL
+            for (int i = 0; i < size<1>(rAccS); i++) {
+                const int real_m = q_tile * kBlockM + i * 16 * kNWarps + (threadIdx.x / 32) * 16 + ((threadIdx.x % 32) / 4) + mi * 8;
+                CUTE_UNROLL
+                for (int nj = 0; nj < size<0, 0>(rAccS); nj++) {
+                    CUTE_UNROLL
+                    for (int j = 0; j < size<2>(rAccS); j++) {
+                        const int real_n = block * kBlockN + j * 8 + (threadIdx.x % 4) * 2 + nj;
+                        if (real_m >= params.q_seqlen || real_n >= params.kv_seqlen) {
+                            rAccS(make_coord(nj, mi), i, j) = -FLT_MAX;
+                        }
+                    }
+                }
+            }
         }
 
         // softmax
@@ -292,7 +368,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
 
             CUTE_UNROLL
             for (int col = 0; col < size<1>(rS_fp32); col++) {
-                rS_fp32(row, col) = expf((rS_fp32(row, col) - new_rowmax) * params.softmax_scale);
+                rS_fp32(row, col) = rS_fp32(row, col) == -FLT_MAX ? 0 : expf((rS_fp32(row, col) - new_rowmax) * params.softmax_scale);
             }
 
             float& prev_rowsum = scores_sum(row);
@@ -310,7 +386,11 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
 
         // O = S * V
         // 由于 S 计算出来是 fp32，参与下一个 mma 计算前，先转换为 fp16
+        // 这里很奇怪，当你去 print_tensor 的时候，会发现 rP 转换结果是错误的，但是最终计算出来的结果是正确的
+        // 暂时没想到原因
         Tensor rP = convert_type<half_t>(rS_fp32);
+        // Tensor rP = convert_type_f322f16(rS_fp32);
+
         // layout C:((2, 2), MMA_M, MMA_N) -> layout A:((2, 2, 2), MMA_M, MMA_N / 2)
         // 即 ((2, 2), 1, 8) -> ((2, 2, 2), 1, 4)
         // ((2, 2), 1, 8)
@@ -344,7 +424,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     Tensor rO_fp32 = make_tensor(rAccO.data(), flat2d_layoutO);
     CUTE_UNROLL
     for (int row = 0; row < size<0>(rO_fp32); row++) {
-        float scale = 1 / scores_sum(row);
+        float scale = scores_sum(row) == 0 ? 1 : 1 / scores_sum(row);
         CUTE_UNROLL
         for (int col = 0; col < size<1>(rO_fp32); col++) {
             rO_fp32(row, col) *= scale;
@@ -352,7 +432,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     }
     // write back
     Tensor rO = convert_type<half_t>(rO_fp32);
-
+    // Tensor rO = convert_type_f322f16(rO_fp32);
 
     Tensor tAccOrO = make_tensor(rO.data(), layout(rAccO));
     // 先复制到 smem，再写回 gmem
@@ -367,6 +447,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
 
     copy(smem_tiled_copy_O, tAccOrO, tAccOsO);
 
+    Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));
     TiledCopy gmem_tiled_copy_O = make_tiled_copy(
         Copy_Atom<UniversalCopy<uint128_t>, half_t>{},
         Layout<Shape<Int<kNThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>, Stride<Int<kGmemThreadsPerRow>, _1>>{}, // thread layout
@@ -376,7 +457,9 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
     Tensor tOgO = gmem_thr_copy_O.partition_D(gO(_, _, 0));
     __syncthreads();
-    copy(gmem_tiled_copy_O, tOsO, tOgO);
+
+    Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+    copy(gmem_tiled_copy_O, tOcO, make_tuple(params.q_seqlen - q_tile * kBlockM, params.headdim), tOsO, tOgO);
 }
 
 

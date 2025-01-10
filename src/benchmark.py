@@ -21,11 +21,13 @@ flash_attention_ext = load(
         "-Xcompiler", "/w",
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
+        "-lineinfo",
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
-        # "-U__CUDA_NO_HALF2_OPERATORS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
         # "-U__CUDA_NO_BFLOAT16_OPERATORS__",
         # "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        # "-U__CUDA_NO_BFLOAT162_OPERATORS__",
     ],
     extra_include_paths=[
         str(ROOT / "include"),
@@ -43,7 +45,10 @@ def flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float =
     # scale: float
     scale = (q.size(-1) ** -0.5) if scale is None else scale
     head_dim = q.size(3)
+
+    need_padding = False
     if head_dim % 8 != 0:
+        need_padding = True
         q = torch.nn.functional.pad(q, [0, 8 - head_dim % 8])
         k = torch.nn.functional.pad(k, [0, 8 - head_dim % 8])
         v = torch.nn.functional.pad(v, [0, 8 - head_dim % 8])
@@ -51,10 +56,13 @@ def flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float =
     k = k.contiguous() if k.stride(3) != -1 else k
     v = v.contiguous() if v.stride(3) != -1 else v
     attn = flash_attention_ext.flash_attention_v2_cute(q, k, v, scale)
+    if need_padding:
+        attn = attn[:, :, :, :head_dim]
     return attn
 
-
-def select_thrCreg_SM80_16x8x16_F16F16F16F16_TN(C, thridx):
+def select_thrCreg_SM80_16x8x16_F16F16F16F16_TN(C: torch.Tensor, thridx):
+    C = torch.nn.functional.pad(C, [0, (8 - C.size(1) % 8) % 8, 0, (16 - C.size(0) % 16) % 16])
+    print("C shape:", C.shape)
     atom_m, atom_n = C.size(0) // 16, C.size(1) // 8
     thr_m, thr_n = thridx // 4, thridx % 4
     reg = torch.zeros((atom_m * 2, atom_n * 2), device=C.device, dtype=C.dtype)
@@ -73,6 +81,7 @@ def sdpa(query, key, value, scale=None, mask=None):
     value = value.float()
     scale_factor = (query.size(-1) ** -0.5) if scale is None else scale
     scores = torch.matmul(query, key.transpose(-2, -1)) * scale_factor
+    # print(select_thrCreg_SM80_16x8x16_F16F16F16F16_TN(torch.matmul(query, key.transpose(-2, -1))[0, 0, :, :], 0))
     if mask is not None:
         scores = scores.masked_fill(mask == 0, float('-inf'))
     attn = torch.softmax(scores, dim=-1)
@@ -85,13 +94,13 @@ def mse(a, b):
     return torch.mean((a - b) ** 2)
 
 def benchmark(iter = 100):
-    bs = 2
+    bs = 16
     num_heads = 16
     seq_len = 512
     dim = 128
     q = torch.randn((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
-    k = torch.randn((bs, num_heads, seq_len*2, dim), dtype=torch.half, device="cuda")
-    v = torch.randn((bs, num_heads, seq_len*2, dim), dtype=torch.half, device="cuda")
+    k = torch.randn((bs, num_heads, seq_len * 2, dim), dtype=torch.half, device="cuda")
+    v = torch.randn((bs, num_heads, seq_len * 2, dim), dtype=torch.half, device="cuda")
     # q = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
     # k = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
     # v = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
