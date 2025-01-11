@@ -59,6 +59,43 @@ __forceinline__ __device__ void copy(
     }
 }
 
+template<class MMA_Atom>
+CUTE_HOST_DEVICE constexpr auto get_thr_C_shape(MMA_Atom const& mma_atom) {
+    using namespace cute;
+    using AtomLayoutC_TV = typename MMA_Atom::LayoutC_TV;
+    using AtomShapeMNK = typename MMA_Atom::Shape_MNK;
+    auto V = layout<1>(AtomLayoutC_TV{});
+    auto C = select<0, 1>(AtomShapeMNK{});
+    auto R = complement(V, C);
+    auto val_shape = shape(R);
+    auto thr_shape = make_shape(
+        ceil_div(get<0>(C), get<0>(val_shape)),
+        ceil_div(get<1>(C), get<1>(val_shape))
+    );
+    return thr_shape;
+}
+
+template<class TiledMMA, class TVCrd, class MNCrd>
+CUTE_HOST_DEVICE constexpr auto tv2crd_C(
+    TiledMMA const& tiled_mma,
+    TVCrd const& tv_crd,
+    MNCrd const& mn_crd = cute::Coord<cute::_0, cute::_0>{}
+) {
+    using namespace cute;
+    using AtomShapeMNK = typename TiledMMA::AtomShape_MNK;
+    auto ref_C = make_layout(make_shape(
+        size<1>(tiled_mma.get_thr_layout_vmnk()) * get<0>(AtomShapeMNK{}),
+        size<2>(tiled_mma.get_thr_layout_vmnk()) * get<1>(AtomShapeMNK{})
+    ));
+    auto layoutC_TV = tiled_mma.thrfrg_C(ref_C);
+    auto idx = layoutC_TV(tv_crd);
+    auto inner_crd = ref_C.get_flat_coord(idx);
+    auto crd = make_coord(
+        get<0>(inner_crd) + get<0>(mn_crd) * shape<0>(ref_C),
+        get<1>(inner_crd) + get<1>(mn_crd) * shape<1>(ref_C)
+    );
+    return crd;
+}
 //  query: [batch_size, num_heads,  q_seqlen, qk_headdim]
 //    key: [batch_size, num_heads, kv_seqlen, qk_headdim]
 //  score: [batch_size, num_heads,  q_seqlen,  kv_seqlen]
@@ -252,10 +289,12 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     cp_async_fence();
 
     clear(rAccO);
-    Tensor scores_max = make_tensor<float>(make_shape(Int<size<1>(rAccS) * 2>{}));
+
+    auto thr_C_row = size<1>(get_thr_C_shape(MMA_Atom_Arch{}));
+    Tensor scores_max = make_tensor<float>(make_shape(size<1>(rAccS) * thr_C_row));
     // 这里 x2 是因为 SM80_16x8x16_F32F16F16F32_TN 的 LayoutC_TV 是 ((4, 8), (2, 2)):((32, 1), (16, 8))
     // 意味着一共使用 32 个线程，每个线程处理 (2, 2) 个值，也就是每个线程有 2 行需要计算 max 和 sum
-    Tensor scores_sum = make_tensor<float>(make_shape(Int<size<1>(rAccS) * 2>{}));
+    Tensor scores_sum = make_tensor<float>(make_shape(size<1>(rAccS) * thr_C_row));
 
     // 记得初始化这里
     fill(scores_max, -FLT_MAX);
@@ -306,19 +345,18 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
         }
 
         // mask rAccS，越界的值置为 -FLT_MAX
+        // 这种使用 layout 计算的方法比之前纯手写要慢 2% 左右
         CUTE_UNROLL
-        for (int mi = 0; mi < size<0, 1>(rAccS); mi++) {
+        for (int v = 0; v < size<0>(rAccS); v++) {
             CUTE_UNROLL
-            for (int i = 0; i < size<1>(rAccS); i++) {
-                const int real_m = q_tile * kBlockM + i * 16 * kNWarps + (threadIdx.x / 32) * 16 + ((threadIdx.x % 32) / 4) + mi * 8;
+            for (int m = 0; m < size<1>(rAccS); m++) {
                 CUTE_UNROLL
-                for (int nj = 0; nj < size<0, 0>(rAccS); nj++) {
-                    CUTE_UNROLL
-                    for (int j = 0; j < size<2>(rAccS); j++) {
-                        const int real_n = block * kBlockN + j * 8 + (threadIdx.x % 4) * 2 + nj;
-                        if (real_m >= params.q_seqlen || real_n >= params.kv_seqlen) {
-                            rAccS(make_coord(nj, mi), i, j) = -FLT_MAX;
-                        }
+                for (int n = 0; n < size<2>(rAccS); n++) {
+                    auto crd = tv2crd_C(tiled_mma, make_coord(threadIdx.x, v), make_coord(m, n));
+                    const int real_m = q_tile * kBlockM + get<0>(crd);
+                    const int real_n = block * kBlockN + get<1>(crd);
+                    if (real_m >= params.q_seqlen || real_n >= params.kv_seqlen) {
+                        rAccS(v, m, n) = -FLT_MAX;
                     }
                 }
             }
