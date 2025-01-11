@@ -18,6 +18,7 @@ __forceinline__ __device__ auto convert_type(cute::Tensor<Engine, Layout> const 
     auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
     return cute::make_tensor(cute::make_rmem_ptr<To_type>(&frag), tensor.layout());
 }
+
 // #include <cuda_fp16.h>
 // template <typename STensor>
 // __forceinline__ __device__ auto convert_type_f322f16(STensor const &acc_fp32) {
@@ -32,7 +33,7 @@ __forceinline__ __device__ auto convert_type(cute::Tensor<Engine, Layout> const 
 //     return acc_fp16;
 // }
 
-template <class TiledCopy, class IdentityTensor, class MaxMN, class  STensor, class DTensor>
+template <bool IsClearOOB = true, class TiledCopy, class IdentityTensor, class MaxMN, class  STensor, class DTensor>
 __forceinline__ __device__ void copy(
     TiledCopy const& tiled_copy,
     IdentityTensor const& identity, // (CPY, CPY_M, CPY_N)
@@ -48,11 +49,11 @@ __forceinline__ __device__ void copy(
             for (int n = 0; n < size<2>(src); n++) {
                 if (get<1>(identity(0, m, n)) < get<1>(max_mn)) {
                     copy(tiled_copy, src(_, m, n), dst(_, m, n));
-                } else {
+                } else if (IsClearOOB) {
                     clear(dst(_, m, n));
                 }
             }
-        } else {
+        } else if (IsClearOOB) {
             clear(dst(_, m, _));
         }
     }
@@ -459,7 +460,9 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     __syncthreads();
 
     Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
-    copy(gmem_tiled_copy_O, tOcO, make_tuple(params.q_seqlen - q_tile * kBlockM, params.headdim), tOsO, tOgO);
+
+    // 最后复制 O 到 gmem 时，要关闭 IsClearOOB，因为 mO 的尺寸不一定等于 gO，会有值被覆盖为 0 的情况
+    copy<false>(gmem_tiled_copy_O, tOcO, make_tuple(params.q_seqlen - q_tile * kBlockM, params.headdim), tOsO, tOgO);
 }
 
 
