@@ -115,7 +115,10 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     constexpr int kHeadDim = 128;
     constexpr int kNWarps = 4;
     constexpr int kNThreads = kNWarps * WARP_SIZE;
-    
+    constexpr int kBlockKSmem = 64;
+    constexpr int kGmemElemsPerLoad = sizeof(uint128_t) / sizeof(half_t);
+    constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
+
     const int batch = blockIdx.z;
     const int head = blockIdx.y;
     const int q_tile = blockIdx.x;
@@ -177,11 +180,39 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     Tensor gO = local_tile(mO, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(q_tile, _));
 
     // TODO: 需要 Swizzle 优化
-    using SmemLayoutQ = decltype(make_layout(make_shape(Int<kBlockM>{}, Int<kHeadDim>{}), make_stride(Int<kHeadDim>{}, Int<1>{})));
-    using SmemLayoutK = decltype(make_layout(make_shape(Int<kBlockN>{}, Int<kHeadDim>{}), make_stride(Int<kHeadDim>{}, Int<1>{})));
-    using SmemLayoutV = decltype(make_layout(make_shape(Int<kBlockN>{}, Int<kHeadDim>{}), make_stride(Int<kHeadDim>{}, Int<1>{})));
-    using SmemLayoutVt = decltype(make_layout(make_shape(Int<kHeadDim>{}, Int<kBlockN>{}), make_stride(Int<1>{}, Int<kHeadDim>{})));
-    using SmemLayoutO = decltype(make_layout(make_shape(Int<kBlockM>{}, Int<kHeadDim>{}), make_stride(Int<kHeadDim>{}, Int<1>{})));
+    // 一个可以一行或一列完全 bank conflict free 的布局，8x64
+    // no swizzle:
+    //   0   1   2   3   4   5   6   7
+    //   8   9  10  11  12  13  14  15
+    //  16  17  18  19  20  21  22  23
+    //  24  25  26  27  28  29  30  31
+    //  32  33  34  35  36  37  38  39
+    //  40  41  42  43  44  45  46  47
+    //  48  49  50  51  52  53  54  55
+    //  56  57  58  59  60  61  62  63
+    //
+    // swizzle:
+    //   0   1   2   3   4   5   6   7
+    //   9   8  11  10  13  12  15  14
+    //  18  19  16  17  22  23  20  21
+    //  27  26  25  24  31  30  29  28
+    //  36  37  38  39  32  33  34  35
+    //  45  44  47  46  41  40  43  42
+    //  54  55  52  53  58  59  56  57
+    //  63  62  61  60  59  58  57  56
+    // 其中每个元素包含一个 1x8 的向量，所以这个布局是 8x64 的
+    using SmemLayoutAtom = decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<Int<8>, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, Int<1>>>{}));
+    using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtom{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+    using SmemLayoutK = decltype(tile_to_shape(SmemLayoutAtom{}, Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+    using SmemLayoutV = decltype(tile_to_shape(SmemLayoutAtom{}, Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+    // col-major Smem = row-major Smem^T
+    using SmemLayoutAtomTranspose = decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<Int<kBlockKSmem>, Int<8>>, Stride<Int<1>, Int<kBlockKSmem>>>{}));
+    // tile_to_shape 默认按照 col-major 的顺序进行 tile 排列
+    // 但是这里是转置，需要以 row-major 的顺序进行 tile 排列，所以需要 GenRowMajor 或 LayoutRight 或 Step<_1, _0>
+    // 这一点在一些教学项目中没有做，不知道为什么
+    // 比如 https://github.com/66RING/tiny-flash-attention/blob/9c954cf06a15c373a58717aa5a89a58c8616b52a/flash_attention_cutlass/csrc/kernel_traits.h#L98
+    using SmemLayoutVt = decltype(tile_to_shape(SmemLayoutAtomTranspose{}, Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{}));
+    using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtom{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
 
     __shared__ half_t q_smem[cosize(SmemLayoutQ{})];
     __shared__ half_t k_smem[cosize(SmemLayoutK{})];
@@ -200,9 +231,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     // 2. gmem to smem 的定义，需要：
     // 单线程负责的 gmem tiled Tensor
     // 单线程负责的 smem tiled Tensor
-    constexpr int kBlockKSmem = 64;
-    constexpr int kGmemElemsPerLoad = sizeof(uint128_t) / sizeof(half_t);
-    constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
+
     // 一个 TiledCopy 处理 16x64 的矩阵
     TiledCopy gmem_tiled_copy_QKV = make_tiled_copy(
         Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, half_t>{},
@@ -290,7 +319,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
 
     clear(rAccO);
 
-    auto thr_C_row = size<1>(get_thr_C_shape(MMA_Atom_Arch{}));
+    auto thr_C_row = size<0>(get_thr_C_shape(MMA_Atom_Arch{}));
     Tensor scores_max = make_tensor<float>(make_shape(size<1>(rAccS) * thr_C_row));
     // 这里 x2 是因为 SM80_16x8x16_F32F16F16F32_TN 的 LayoutC_TV 是 ((4, 8), (2, 2)):((32, 1), (16, 8))
     // 意味着一共使用 32 个线程，每个线程处理 (2, 2) 个值，也就是每个线程有 2 行需要计算 max 和 sum
