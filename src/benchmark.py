@@ -2,6 +2,7 @@ import torch
 import time 
 from torch.utils.cpp_extension import load
 from pathlib import Path
+from flash_attn import flash_attn_func
 
 torch.set_grad_enabled(False)
 
@@ -38,12 +39,12 @@ flash_attention_ext = load(
 )
 
 
-def flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float = None) -> torch.Tensor:
+def flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float = None) -> torch.Tensor:
     # q: [batch_size, n_heads, q_seq_len,  d]
     # k: [batch_size, n_heads, kv_seq_len, d]
     # v: [batch_size, n_heads, kv_seq_len, d]
     # scale: float
-    scale = (q.size(-1) ** -0.5) if scale is None else scale
+    softmax_scale = (q.size(-1) ** -0.5) if softmax_scale is None else softmax_scale
     head_dim = q.size(3)
 
     need_padding = False
@@ -55,9 +56,19 @@ def flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float =
     q = q.contiguous() if q.stride(3) != -1 else q
     k = k.contiguous() if k.stride(3) != -1 else k
     v = v.contiguous() if v.stride(3) != -1 else v
-    attn = flash_attention_ext.flash_attention_v2_cute(q, k, v, scale)
+    attn = flash_attention_ext.flash_attention_v2_cute(q, k, v, softmax_scale)
     if need_padding:
         attn = attn[:, :, :, :head_dim]
+    return attn
+
+def flash_attention_official(q, k, v, softmax_scale=None):
+    # reshape from [batch_size, n_heads, seq_len, d] to [batch_size, seq_len, n_heads, d]
+    q = q.permute(0, 2, 1, 3)
+    k = k.permute(0, 2, 1, 3)
+    v = v.permute(0, 2, 1, 3)
+    attn = flash_attn_func(q, k, v, softmax_scale=softmax_scale)
+    # reshape back to [batch_size, n_heads, seq_len, d]
+    attn = attn.permute(0, 2, 1, 3)
     return attn
 
 def select_thrCreg_SM80_16x8x16_F16F16F16F16_TN(C: torch.Tensor, thridx):
@@ -74,12 +85,12 @@ def select_thrCreg_SM80_16x8x16_F16F16F16F16_TN(C: torch.Tensor, thridx):
             reg[m * 2 + 1, n * 2 + 1] = C[m * 16 + thr_m + 8, n * 8 + thr_n * 2 + 1]
     return reg
 
-def sdpa(query, key, value, scale=None, mask=None):
+def sdpa(query, key, value, softmax_scale=None, mask=None):
     # query: [batch_size, n_heads, seq_len, d_k]
     query = query.float()
     key = key.float()
     value = value.float()
-    scale_factor = (query.size(-1) ** -0.5) if scale is None else scale
+    scale_factor = (query.size(-1) ** -0.5) if softmax_scale is None else softmax_scale
     scores = torch.matmul(query, key.transpose(-2, -1)) * scale_factor
     # print(select_thrCreg_SM80_16x8x16_F16F16F16F16_TN(torch.matmul(query, key.transpose(-2, -1))[0, 0, :, :], 0))
     if mask is not None:
@@ -122,33 +133,50 @@ def benchmark(iter = 100):
     print("Q shape:", q.shape)
     print("K shape:", k.shape)
     print("V shape:", v.shape)
-    o_cpp = flash_attn(q, k, v)
-    print("O shape(cpp):", o_cpp.shape)
-    o_py = sdpa(q, k, v)
-    print("O shape(py):", o_py.shape)
-    print("MSE:", mse(o_cpp, o_py).item())
-    print("Allclose:", torch.allclose(o_cpp, o_py, atol=1e-3))
+    o_ours = flash_attn(q, k, v)
+    print("O shape(ours):", o_ours.shape)
+    o_pytorch = sdpa(q, k, v)
+    print("O shape(pytorch):", o_pytorch.shape)
+    o_official = flash_attention_official(q, k, v)
+    print("O shape(official):", o_official.shape)
 
-    # print(o_cpp)
-    # print(o_py)
+    print("MSE(ours, pytorch):", mse(o_ours, o_pytorch).item())
+    print("Allclose(ours, pytorch):", torch.allclose(o_ours, o_pytorch, atol=1e-3))
 
-    start = time.time()
-    for _ in range(iter):
-        o_cpp = flash_attn(q, k, v)
-    torch.cuda.synchronize()
-    end = time.time()
-    elapsed = (end - start) * 1e3
-    print(f"Elapsed time (cpp): {elapsed:.3f} ms")
-    print(f"Time per iteration (cpp): {elapsed / iter:.3f} ms")
+    print("MSE(ours, official):", mse(o_ours, o_official).item())
+    print("Allclose(ours, official):", torch.allclose(o_ours, o_official, atol=1e-3))
+
+    # print(o_ours)
+    # print(o_pytorch)
+    # print(o_official)
 
     start = time.time()
     for _ in range(iter):
-        o_py = sdpa(q, k, v)
+        o_ours = flash_attn(q, k, v)
     torch.cuda.synchronize()
     end = time.time()
     elapsed = (end - start) * 1e3
-    print(f"Elapsed time (py): {elapsed:.3f} ms")
-    print(f"Time per iteration (py): {elapsed / iter:.3f} ms")
+    print(f"Elapsed time (ours): {elapsed:.3f} ms")
+    print(f"Time per iteration (ours): {elapsed / iter:.3f} ms")
+
+    start = time.time()
+    for _ in range(iter):
+        o_pytorch = sdpa(q, k, v)
+    torch.cuda.synchronize()
+    end = time.time()
+    elapsed = (end - start) * 1e3
+    print(f"Elapsed time (pytorch): {elapsed:.3f} ms")
+    print(f"Time per iteration (pytorch): {elapsed / iter:.3f} ms")
+
+
+    start = time.time()
+    for _ in range(iter):
+        o_official = flash_attention_official(q, k, v)
+    torch.cuda.synchronize()
+    end = time.time()
+    elapsed = (end - start) * 1e3
+    print(f"Elapsed time (official): {elapsed:.3f} ms")
+    print(f"Time per iteration (official): {elapsed / iter:.3f} ms")
 
 if __name__ == "__main__":
     benchmark()
