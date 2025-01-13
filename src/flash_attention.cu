@@ -42,6 +42,7 @@ __forceinline__ __device__ void copy(
     DTensor& dst                    // (CPY, CPY_M, CPY_N)
 ) {
     using namespace cute;
+    // copy(tiled_copy, src, dst);
     CUTE_UNROLL
     for (int m = 0; m < size<1>(src); m++) {
         if (get<0>(identity(0, m, 0)) < get<0>(max_mn)) {
@@ -60,7 +61,7 @@ __forceinline__ __device__ void copy(
 }
 
 template<class MMA_Atom>
-CUTE_HOST_DEVICE constexpr auto get_thr_C_shape(MMA_Atom const& mma_atom) {
+CUTE_HOST_DEVICE constexpr auto get_atom_thr_C_shape(MMA_Atom const& mma_atom) {
     using namespace cute;
     using AtomLayoutC_TV = typename MMA_Atom::LayoutC_TV;
     using AtomShapeMNK = typename MMA_Atom::Shape_MNK;
@@ -286,28 +287,31 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     // 定义 smem 到 reg 的 tild copy 对象
     // 按照 tiled_mma 划分，所以划分出来的块对应一个线程中 mma 消耗的数据
     TiledCopy smem_tiled_copy_Q = make_tiled_copy_A(
-        Copy_Atom<DefaultCopy, half_t>{},
+        Copy_Atom<SM75_U32x4_LDSM_N, half_t>{},
         tiled_mma
     );
     ThrCopy smem_thr_copy_Q = smem_tiled_copy_Q.get_slice(threadIdx.x);
     // (CPY, CPY_M, CPY_K) = ((1, (2, 2, 2)), 1, 8)
     Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
+    Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
 
     TiledCopy smem_tiled_copy_K = make_tiled_copy_B(
-        Copy_Atom<DefaultCopy, half_t>{},
+        Copy_Atom<SM75_U32x4_LDSM_N, half_t>{},
         tiled_mma
     );
     ThrCopy smem_thr_copy_K = smem_tiled_copy_K.get_slice(threadIdx.x);
     // 根据 TiledMMA 划分不同的 TiledCopy，显然这里就会考虑 MMAValLayout/Permutations
     // (CPY, CPY_N, CPY_K) = ((1, (2, 2, 2)), 4, 8)
     Tensor tSsK = smem_thr_copy_K.partition_S(sK);
+    Tensor tSrK_copy_view = smem_thr_copy_K.retile_D(tSrK);
 
     TiledCopy smem_tiled_copy_V = make_tiled_copy_B(
-        Copy_Atom<DefaultCopy, half_t>{},
+        Copy_Atom<SM75_U16x8_LDSM_T, half_t>{},
         tiled_mma
     );
     ThrCopy smem_thr_copy_V = smem_tiled_copy_V.get_slice(threadIdx.x);
     Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+    Tensor tOrVt_copy_view = smem_thr_copy_V.retile_D(tOrVt);
 
     copy(gmem_tiled_copy_QKV, tQcQ, make_tuple(params.q_seqlen - q_tile * kBlockM, params.headdim), tQgQ, tQsQ);
     cp_async_fence();
@@ -319,7 +323,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
 
     clear(rAccO);
 
-    auto thr_C_row = size<0>(get_thr_C_shape(MMA_Atom_Arch{}));
+    auto thr_C_row = size<0>(get_atom_thr_C_shape(MMA_Atom_Arch{})) * size<1>(rAccS);
     Tensor scores_max = make_tensor<float>(make_shape(size<1>(rAccS) * thr_C_row));
     // 这里 x2 是因为 SM80_16x8x16_F32F16F16F32_TN 的 LayoutC_TV 是 ((4, 8), (2, 2)):((32, 1), (16, 8))
     // 意味着一共使用 32 个线程，每个线程处理 (2, 2) 个值，也就是每个线程有 2 行需要计算 max 和 sum
@@ -347,14 +351,14 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
         cp_async_fence();
 
         // S = Q * K^T
-        copy(smem_tiled_copy_Q, tSsQ(_, _, 0), tSrQ(_, _, 0));
-        copy(smem_tiled_copy_K, tSsK(_, _, 0), tSrK(_, _, 0));
+        copy(smem_tiled_copy_Q, tSsQ(_, _, 0), tSrQ_copy_view(_, _, 0));
+        copy(smem_tiled_copy_K, tSsK(_, _, 0), tSrK_copy_view(_, _, 0));
 
         CUTE_UNROLL
         for (int sub_block = 0; sub_block < size<2>(tSrQ); sub_block ++) {
             if (sub_block < size<2>(tSrQ) - 1) {
-                copy(smem_tiled_copy_Q, tSsQ(_, _, sub_block + 1), tSrQ(_, _, sub_block + 1));
-                copy(smem_tiled_copy_K, tSsK(_, _, sub_block + 1), tSrK(_, _, sub_block + 1));
+                copy(smem_tiled_copy_Q, tSsQ(_, _, sub_block + 1), tSrQ_copy_view(_, _, sub_block + 1));
+                copy(smem_tiled_copy_K, tSsK(_, _, sub_block + 1), tSrK_copy_view(_, _, sub_block + 1));
             }
             gemm(tiled_mma, tSrQ(_, _, sub_block), tSrK(_, _, sub_block), rAccS);
         }
@@ -479,11 +483,11 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
         // 不过这里 tOrVt_view 和 tOrVt 的 1D 坐标到 index 的映射是一样的，所以应该可以不需要 retile
         // Tensor tOrVt_view = smem_thr_copy_V.retile_D(tOrVt);
         // 注意 tOrP 已经全部在寄存器中了，所以只 copy V 从 smem 到 reg 即可
-        copy(smem_tiled_copy_V, tOsVt(_, _, 0), tOrVt(_, _, 0));
+        copy(smem_tiled_copy_V, tOsVt(_, _, 0), tOrVt_copy_view(_, _, 0));
         CUTE_UNROLL
         for (int sub_block = 0; sub_block < size<2>(tOrP); sub_block++) {
             if (sub_block < size<2>(tOrP) - 1) {
-                copy(smem_tiled_copy_V, tOsVt(_, _, sub_block + 1), tOrVt(_, _, sub_block + 1));
+                copy(smem_tiled_copy_V, tOsVt(_, _, sub_block + 1), tOrVt_copy_view(_, _, sub_block + 1));
             }
             gemm(tiled_mma, tOrP(_, _, sub_block), tOrVt(_, _, sub_block), rAccO);
         }
