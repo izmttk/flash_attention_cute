@@ -22,6 +22,7 @@ flash_attention_ext = load(
         "-Xcompiler", "/w",
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
+        "--use_fast_math", # used for expf
         "-lineinfo",
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
