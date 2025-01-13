@@ -235,7 +235,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
 
     // 一个 TiledCopy 处理 16x64 的矩阵
     TiledCopy gmem_tiled_copy_QKV = make_tiled_copy(
-        Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, half_t>{},
+        Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, half_t>{},
         Layout<Shape<Int<kNThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>, Stride<Int<kGmemThreadsPerRow>, _1>>{}, // thread layout
         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{} // value layout
     );
@@ -510,7 +510,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     // 先复制到 smem，再写回 gmem
     // 因为寄存器是分散再各个线程上的，先写回 smem 可以使用向量化指令，实现更高带宽？？？
     TiledCopy smem_tiled_copy_O = make_tiled_copy_C(
-        Copy_Atom<DefaultCopy, half_t>{},
+        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, half_t>{},
         tiled_mma
     );
     ThrCopy smem_thr_copy_O = smem_tiled_copy_O.get_slice(threadIdx.x);
@@ -521,7 +521,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
 
     Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));
     TiledCopy gmem_tiled_copy_O = make_tiled_copy(
-        Copy_Atom<UniversalCopy<uint128_t>, half_t>{},
+        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, half_t>{},
         Layout<Shape<Int<kNThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>, Stride<Int<kGmemThreadsPerRow>, _1>>{}, // thread layout
         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{} // value layout
     );
