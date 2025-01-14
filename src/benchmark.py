@@ -14,7 +14,7 @@ flash_attention_ext = load(
     name="flash_attention",
     sources=[
         str(CSRC / "flash_attention_api.cpp"),
-        str(CSRC / "flash_attention.cu"),
+        str(CSRC / "flash_attention_hdim128_fp16.cu"),
     ],
     extra_cuda_cflags=[
         "-O2",
@@ -27,6 +27,7 @@ flash_attention_ext = load(
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_HALF2_OPERATORS__",
+        
         # "-U__CUDA_NO_BFLOAT16_OPERATORS__",
         # "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
         # "-U__CUDA_NO_BFLOAT162_OPERATORS__",
@@ -108,11 +109,12 @@ def mse(a, b):
 def benchmark(iter = 100):
     bs = 16
     num_heads = 16
-    seq_len = 512
+    q_seqlen = 1024
+    kv_seqlen = 1024
     dim = 128
-    q = torch.randn((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
-    k = torch.randn((bs, num_heads, seq_len * 2, dim), dtype=torch.half, device="cuda")
-    v = torch.randn((bs, num_heads, seq_len * 2, dim), dtype=torch.half, device="cuda")
+    q = torch.randn((bs, num_heads, q_seqlen, dim), dtype=torch.half, device="cuda")
+    k = torch.randn((bs, num_heads, kv_seqlen, dim), dtype=torch.half, device="cuda")
+    v = torch.randn((bs, num_heads, kv_seqlen, dim), dtype=torch.half, device="cuda")
     # q = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
     # k = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
     # v = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")

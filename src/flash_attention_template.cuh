@@ -1,3 +1,4 @@
+#pragma once
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -60,22 +61,6 @@ __forceinline__ __device__ void copy(
     }
 }
 
-template<class MMA_Atom>
-CUTE_HOST_DEVICE constexpr auto get_atom_thr_C_shape(MMA_Atom const& mma_atom) {
-    using namespace cute;
-    using AtomLayoutC_TV = typename MMA_Atom::LayoutC_TV;
-    using AtomShapeMNK = typename MMA_Atom::Shape_MNK;
-    auto V = layout<1>(AtomLayoutC_TV{});
-    auto C = select<0, 1>(AtomShapeMNK{});
-    auto R = complement(V, C);
-    auto val_shape = shape(R);
-    auto thr_shape = make_shape(
-        ceil_div(get<0>(C), get<0>(val_shape)),
-        ceil_div(get<1>(C), get<1>(val_shape))
-    );
-    return thr_shape;
-}
-
 template<class TiledMMA, class TVCrd, class MNCrd>
 CUTE_HOST_DEVICE constexpr auto tv2crd_C(
     TiledMMA const& tiled_mma,
@@ -97,6 +82,47 @@ CUTE_HOST_DEVICE constexpr auto tv2crd_C(
     );
     return crd;
 }
+
+template<class Layout>
+CUTE_HOST_DEVICE constexpr auto convert_layout_partition_C_to_2d(Layout const& c_layout) {
+    // (MMA=4, MMA_M, MMA_N) to ((Tile=2, Rest=2), MMA_M, MMA_N)
+    using namespace cute;
+    // (MMA=4, MMA_M, MMA_N) to ((Tile=2, Rest=2), MMA_M, MMA_N)
+    // 这里会仅对第一个维度，即 MMA 进行划分，划分出来一个 MMA 中 mode-0 是行，mode-1 是列
+    // MMA mode: (V0 V1 V2 V3)   -->   ((V0 V1), (V2 V3))
+    // tiler 等同于 Tile<Layout<Shape<2>, Stride<1>>>
+    auto layout_mma_2d = logical_divide(c_layout, make_shape(Int<2>{}));
+
+    // ((Tile=2, Rest=2), MMA_M, MMA_N) to ((Tile=2, MMA_M), (Rest=2, MMA_N))
+    // Tile 划分出来同一行的值，Rest 代表了一个 MMA 中有多少行
+    // 注意这里并只是改变了元素的访问顺序，没有交换寄存器值
+    auto layout_2d = make_layout(
+        // 所以行方向上，Rest 维度 x MMA_M = 一个线程上数据在矩阵中的总行数
+        make_layout(get<0, 1>(layout_mma_2d), get<1>(layout_mma_2d)),
+        // 列方向上，Tile 维度 x MMA_N = 一个线程上数据在矩阵中的总列数
+        make_layout(get<0, 0>(layout_mma_2d), get<2>(layout_mma_2d))
+    );
+    return layout_2d;
+}
+
+template<class Layout>
+CUTE_HOST_DEVICE constexpr auto convert_layout_partition_C_to_A(Layout const& c_layout) {
+    // (MMA=4, MMA_M, MMA_N) to ((MMA=4, 2), MMA_M, MMA_N / 2)
+    using namespace cute;
+    // (MMA=4, MMA_M, MMA_N) to (MMA=4, MMA_M, (Tile=2, MMA_N / 2))
+    // 这里会仅对 MMA_N 这个维度进行分割
+    auto layout_split_n = logical_divide(c_layout, make_tile(_, _, Int<2>{}));
+
+    // (MMA=4, MMA_M, (Tile=2, MMA_N / 2)) to ((MMA=4, 2), MMA_M, MMA_N / 2)
+    // 注意这里并只是改变了元素的访问顺序，没有交换寄存器值
+    auto layout_a = make_layout(
+        make_layout(get<0>(layout_split_n), get<2, 0>(layout_split_n)),
+        get<1>(layout_split_n),
+        get<2, 1>(layout_split_n)
+    );
+    return layout_a;
+}
+
 //  query: [batch_size, num_heads,  q_seqlen, qk_headdim]
 //    key: [batch_size, num_heads, kv_seqlen, qk_headdim]
 //  score: [batch_size, num_heads,  q_seqlen,  kv_seqlen]
@@ -108,16 +134,13 @@ CUTE_HOST_DEVICE constexpr auto tv2crd_C(
 // cuda 分配的内存默认 256 字节对齐，所以不需要担心指针不对齐向量访存大小的问题
 // 向量化访存 128bit 是沿着 head dim 方向进行的，所以只需要确保 head_dim 大小是 8 的倍数即可（对于半精度数据而言）
 // 同时在内存连续性上，只要求最后一维，即 head dim 连续即可，即 stride 为 1，其他的维度通过参数中的各自 stride 来控制
+template<typename T, int kBlockM, int kBlockN, int kHeadDim, int kNWarps>
 __global__ void flash_attention_v2(FlashAttentionParams params) {
     using namespace cute;
 
-    constexpr int kBlockM = 64; // Br
-    constexpr int kBlockN = 64; // Bc
-    constexpr int kHeadDim = 128;
-    constexpr int kNWarps = 4;
     constexpr int kNThreads = kNWarps * WARP_SIZE;
     constexpr int kBlockKSmem = 64;
-    constexpr int kGmemElemsPerLoad = sizeof(uint128_t) / sizeof(half_t);
+    constexpr int kGmemElemsPerLoad = sizeof(uint128_t) / sizeof(T);
     constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
 
     const int batch = blockIdx.z;
@@ -159,10 +182,10 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     // // O: (q_seqlen, v_headdim)
     // Tensor O = mO(batch, head, _, _);
 
-    half_t *q_offset = reinterpret_cast<half_t*>(params.q_ptr) + batch * params.q_batch_stride + head * params.q_head_stride;
-    half_t *k_offset = reinterpret_cast<half_t*>(params.k_ptr) + batch * params.k_batch_stride + head * params.k_head_stride;
-    half_t *v_offset = reinterpret_cast<half_t*>(params.v_ptr) + batch * params.v_batch_stride + head * params.v_head_stride;
-    half_t *o_offset = reinterpret_cast<half_t*>(params.o_ptr) + batch * params.o_batch_stride + head * params.o_head_stride;
+    T *q_offset = reinterpret_cast<T*>(params.q_ptr) + batch * params.q_batch_stride + head * params.q_head_stride;
+    T *k_offset = reinterpret_cast<T*>(params.k_ptr) + batch * params.k_batch_stride + head * params.k_head_stride;
+    T *v_offset = reinterpret_cast<T*>(params.v_ptr) + batch * params.v_batch_stride + head * params.v_head_stride;
+    T *o_offset = reinterpret_cast<T*>(params.o_ptr) + batch * params.o_batch_stride + head * params.o_head_stride;
 
     Tensor mQ = make_tensor(make_gmem_ptr(q_offset), make_layout(make_shape(params.q_seqlen, params.headdim), make_stride(params.q_seqlen_stride, Int<1>{})));
     Tensor mK = make_tensor(make_gmem_ptr(k_offset), make_layout(make_shape(params.kv_seqlen, params.headdim), make_stride(params.k_seqlen_stride, Int<1>{})));
@@ -215,9 +238,9 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     using SmemLayoutVt = decltype(tile_to_shape(SmemLayoutAtomTranspose{}, Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{}));
     using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtom{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
 
-    __shared__ half_t q_smem[cosize(SmemLayoutQ{})];
-    __shared__ half_t k_smem[cosize(SmemLayoutK{})];
-    __shared__ half_t v_smem[cosize(SmemLayoutV{})];
+    __shared__ T q_smem[cosize(SmemLayoutQ{})];
+    __shared__ T k_smem[cosize(SmemLayoutK{})];
+    __shared__ T v_smem[cosize(SmemLayoutV{})];
 
     Tensor sQ = make_tensor(make_smem_ptr(q_smem), SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(k_smem), SmemLayoutK{});
@@ -235,7 +258,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
 
     // 一个 TiledCopy 处理 16x64 的矩阵
     TiledCopy gmem_tiled_copy_QKV = make_tiled_copy(
-        Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, half_t>{},
+        Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, T>{},
         Layout<Shape<Int<kNThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>, Stride<Int<kGmemThreadsPerRow>, _1>>{}, // thread layout
         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{} // value layout
     );
@@ -287,7 +310,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     // 定义 smem 到 reg 的 tild copy 对象
     // 按照 tiled_mma 划分，所以划分出来的块对应一个线程中 mma 消耗的数据
     TiledCopy smem_tiled_copy_Q = make_tiled_copy_A(
-        Copy_Atom<SM75_U32x4_LDSM_N, half_t>{},
+        Copy_Atom<SM75_U32x4_LDSM_N, T>{},
         tiled_mma
     );
     ThrCopy smem_thr_copy_Q = smem_tiled_copy_Q.get_slice(threadIdx.x);
@@ -296,7 +319,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
 
     TiledCopy smem_tiled_copy_K = make_tiled_copy_B(
-        Copy_Atom<SM75_U32x4_LDSM_N, half_t>{},
+        Copy_Atom<SM75_U32x4_LDSM_N, T>{},
         tiled_mma
     );
     ThrCopy smem_thr_copy_K = smem_tiled_copy_K.get_slice(threadIdx.x);
@@ -306,7 +329,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
     Tensor tSrK_copy_view = smem_thr_copy_K.retile_D(tSrK);
 
     TiledCopy smem_tiled_copy_V = make_tiled_copy_B(
-        Copy_Atom<SM75_U16x8_LDSM_T, half_t>{},
+        Copy_Atom<SM75_U16x8_LDSM_T, T>{},
         tiled_mma
     );
     ThrCopy smem_thr_copy_V = smem_tiled_copy_V.get_slice(threadIdx.x);
@@ -323,11 +346,12 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
 
     clear(rAccO);
 
-    auto thr_C_row = size<0>(get_atom_thr_C_shape(MMA_Atom_Arch{})) * size<1>(rAccS);
-    Tensor scores_max = make_tensor<float>(make_shape(size<1>(rAccS) * thr_C_row));
+    auto layout_rAccS_2d = convert_layout_partition_C_to_2d(layout(rAccS));
+    auto layout_rAccO_2d = convert_layout_partition_C_to_2d(layout(rAccO));
+    Tensor scores_max = make_tensor<float>(make_shape(size<0>(layout_rAccS_2d)));
     // 这里 x2 是因为 SM80_16x8x16_F32F16F16F32_TN 的 LayoutC_TV 是 ((4, 8), (2, 2)):((32, 1), (16, 8))
     // 意味着一共使用 32 个线程，每个线程处理 (2, 2) 个值，也就是每个线程有 2 行需要计算 max 和 sum
-    Tensor scores_sum = make_tensor<float>(make_shape(size<1>(rAccS) * thr_C_row));
+    Tensor scores_sum = make_tensor<float>(make_shape(size<0>(layout_rAccS_2d)));
 
     // 记得初始化这里
     fill(scores_max, -FLT_MAX);
@@ -410,18 +434,16 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
         // from col-major: V0 V3    to row-major: V0 V1
         //                 V1 V2                  V2 V3
         // 注意这里仅重新将值按照新布局解释，即更改了遍历顺序，并不涉及数据移动
-        auto flat2d_layoutS = zipped_divide(layout(rAccS), Tile<Layout<Shape<_2>, Stride<_2>>>{});
-        Tensor rS_fp32 = make_tensor(rAccS.data(), flat2d_layoutS);
-        auto flat2d_layoutO = zipped_divide(layout(rAccO), Tile<Layout<Shape<_2>, Stride<_2>>>{});
-        Tensor rO_fp32 = make_tensor(rAccO.data(), flat2d_layoutO);
+        Tensor rS_2d = make_tensor(rAccS.data(), layout_rAccS_2d);
+        Tensor rO_2d = make_tensor(rAccO.data(), layout_rAccO_2d);
 
         CUTE_UNROLL
-        for (int row = 0; row < size<0>(rS_fp32); row++) {
+        for (int row = 0; row < size<0>(rS_2d); row++) {
             float& prev_rowmax = scores_max(row);
             float new_rowmax = prev_rowmax;
             CUTE_UNROLL
-            for (int col = 0; col < size<1>(rS_fp32); col++) {
-                new_rowmax = max(new_rowmax, rS_fp32(row, col));
+            for (int col = 0; col < size<1>(rS_2d); col++) {
+                new_rowmax = max(new_rowmax, rS_2d(row, col));
             }
             constexpr int num_threads_per_col = 4;
             CUTE_UNROLL
@@ -434,20 +456,20 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
 
             // 缩放 O
             CUTE_UNROLL
-            for (int col = 0; col < size<1>(rO_fp32); col++) {
-                rO_fp32(row, col) *= scores_scale;
+            for (int col = 0; col < size<1>(rO_2d); col++) {
+                rO_2d(row, col) *= scores_scale;
             }
 
             CUTE_UNROLL
-            for (int col = 0; col < size<1>(rS_fp32); col++) {
-                rS_fp32(row, col) = rS_fp32(row, col) == -FLT_MAX ? 0 : expf((rS_fp32(row, col) - new_rowmax) * params.softmax_scale);
+            for (int col = 0; col < size<1>(rS_2d); col++) {
+                rS_2d(row, col) = rS_2d(row, col) == -FLT_MAX ? 0 : expf((rS_2d(row, col) - new_rowmax) * params.softmax_scale);
             }
 
             float& prev_rowsum = scores_sum(row);
             float new_rowsum = 0.0f;
             CUTE_UNROLL
-            for (int col = 0; col < size<1>(rS_fp32); col++) {
-                new_rowsum += rS_fp32(row, col);
+            for (int col = 0; col < size<1>(rS_2d); col++) {
+                new_rowsum += rS_2d(row, col);
             }
             CUTE_UNROLL
             for (int offset = num_threads_per_col / 2; offset > 0; offset /= 2) {
@@ -460,22 +482,13 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
         // 由于 S 计算出来是 fp32，参与下一个 mma 计算前，先转换为 fp16
         // 这里很奇怪，当你去 print_tensor 的时候，会发现 rP 转换结果是错误的，但是最终计算出来的结果是正确的
         // 暂时没想到原因
-        Tensor rP = convert_type<half_t>(rS_fp32);
-        // Tensor rP = convert_type_f322f16(rS_fp32);
+        Tensor rAccS_cvt = convert_type<T>(rAccS);
+        // Tensor rAccS_cvt = convert_type_f322f16(rAccS);
 
         // layout C:((2, 2), MMA_M, MMA_N) -> layout A:((2, 2, 2), MMA_M, MMA_N / 2)
-        // 即 ((2, 2), 1, 8) -> ((2, 2, 2), 1, 4)
-        // ((2, 2), 1, 8)
-        auto mmaC_layoutP = layout(rAccS);
-        // ((2, 2), 1, (2, 4))
-        auto mmaC_split_layoutP = logical_divide(mmaC_layoutP, make_shape(_, _, Int<2>{}));
-        // ((2, 2, 2), 1, 4)
-        auto mmaA_layoutP = make_layout(
-            append(get<0>(mmaC_split_layoutP), get<0>(get<2>(mmaC_split_layoutP))),
-            get<1>(mmaC_split_layoutP),
-            get<1>(get<2>(mmaC_split_layoutP))
-        );
-        Tensor tOrP = make_tensor(rP.data(), mmaA_layoutP);
+        // 用 m16n8k16 mma 计算得到的矩阵 C，每个线程有 (2, 2) 个值，但是作为下一个 gemm 的 A 矩阵，每个线程需要 (2, 2, 2) 个值
+        // 因此合并 MMA_N 维度相邻两个 mma atom
+        Tensor tOrP = make_tensor(rAccS_cvt.data(), convert_layout_partition_C_to_A(layout(rAccS_cvt)));
         // tOrVt 用 mma atom 进行 partition
         // tOsVt 用 copy atom 进行 partition
         // 这两个 atom 的 value layout 可能不同，用 retile 按照 copy atom 的划分模式重新划分
@@ -492,36 +505,36 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
             gemm(tiled_mma, tOrP(_, _, sub_block), tOrVt(_, _, sub_block), rAccO);
         }
     }
-    auto flat2d_layoutO = zipped_divide(layout(rAccO), Tile<Layout<Shape<_2>, Stride<_2>>>{});
-    Tensor rO_fp32 = make_tensor(rAccO.data(), flat2d_layoutO);
+
+    Tensor rO_2d = make_tensor(rAccO.data(), layout_rAccO_2d);
     CUTE_UNROLL
-    for (int row = 0; row < size<0>(rO_fp32); row++) {
+    for (int row = 0; row < size<0>(rO_2d); row++) {
         float scale = scores_sum(row) == 0 ? 1 : 1 / scores_sum(row);
         CUTE_UNROLL
-        for (int col = 0; col < size<1>(rO_fp32); col++) {
-            rO_fp32(row, col) *= scale;
+        for (int col = 0; col < size<1>(rO_2d); col++) {
+            rO_2d(row, col) *= scale;
         }
     }
     // write back
-    Tensor rO = convert_type<half_t>(rO_fp32);
-    // Tensor rO = convert_type_f322f16(rO_fp32);
+    Tensor rAccO_cvt = convert_type<T>(rAccO);
+    // Tensor rAccO_cvt = convert_type_f322f16(rAccO);
 
-    Tensor tAccOrO = make_tensor(rO.data(), layout(rAccO));
     // 先复制到 smem，再写回 gmem
     // 因为寄存器是分散再各个线程上的，先写回 smem 可以使用向量化指令，实现更高带宽？？？
     TiledCopy smem_tiled_copy_O = make_tiled_copy_C(
-        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, half_t>{},
+        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, T>{},
         tiled_mma
     );
     ThrCopy smem_thr_copy_O = smem_tiled_copy_O.get_slice(threadIdx.x);
-    // Tensor tOrO_view = smem_thr_copy_O.retile_S(tOrO);
+
+    Tensor tAccOrO = smem_thr_copy_O.retile_S(rAccO_cvt);
     Tensor tAccOsO = smem_thr_copy_O.partition_D(sO);
 
     copy(smem_tiled_copy_O, tAccOrO, tAccOsO);
 
     Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));
     TiledCopy gmem_tiled_copy_O = make_tiled_copy(
-        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, half_t>{},
+        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, T>{},
         Layout<Shape<Int<kNThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>, Stride<Int<kGmemThreadsPerRow>, _1>>{}, // thread layout
         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{} // value layout
     );
@@ -537,13 +550,13 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
 }
 
 
-void launch_flash_attention_v2(FlashAttentionParams params) {
-    constexpr int kBlockM = 64; // Br
-    constexpr int kNWarps = 4;
+template <typename T, int kBlockM, int kBlockN, int kHeadDim, int kNWarps>
+void launch_flash_attention(FlashAttentionParams params) {
     constexpr int kNThreads = kNWarps * WARP_SIZE;
     int num_q_tiles = cute::ceil_div(params.q_seqlen, kBlockM);
     dim3 grid(num_q_tiles, params.num_heads, params.batch_size);
     dim3 block(kNThreads);
-    flash_attention_v2<<<grid, block>>>(params);
+    auto flash_attention_func = flash_attention_v2<T, kBlockM, kBlockN, kHeadDim, kNWarps>;
+    flash_attention_func<<<grid, block>>>(params);
     CUDA_ERROR_CHECK(cudaGetLastError());
 }

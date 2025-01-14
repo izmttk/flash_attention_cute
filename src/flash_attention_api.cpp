@@ -1,8 +1,32 @@
 #include <torch/extension.h>
 #include <torch/types.h>
-
-#include <vector>
+#include <cutlass/numeric_types.h>
 #include "flash_attention.cuh"
+
+template <typename T>
+struct ConstantType {
+    using type = T;
+};
+
+template <typename T, T val>
+struct ConstantValue {
+    static constexpr T value = val;
+};
+
+template <class Callback>
+void headdim_dispatch(int headdim, Callback func) {
+    if (headdim <= 128) {
+        constexpr int kHeaddim = 128;
+        func(ConstantValue<int, kHeaddim>{});
+    }
+}
+
+template <class Callback>
+void dtype_dispatch(torch::ScalarType dtype, Callback func) {
+    if (dtype == torch::kHalf) {
+        func(ConstantType<cutlass::half_t>{});
+    }
+}
 
 torch::Tensor flash_attention_v2_cute(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, float softmax_scale) {
@@ -74,11 +98,18 @@ torch::Tensor flash_attention_v2_cute(
         softmax_scale
     };
 
-    AT_DISPATCH_SWITCH(q.scalar_type(), "flash_attention_v2_cute",
-        AT_DISPATCH_CASE(c10::kHalf, [&] {
-            launch_flash_attention_v2(params);
-        })
-    );
+    // AT_DISPATCH_SWITCH(q.scalar_type(), "flash_attention_v2_cute",
+    //     AT_DISPATCH_CASE(c10::kHalf, [&] {
+    //         launch_flash_attention_v2(params);
+    //     })
+    // );
+    dtype_dispatch(q.scalar_type(), [&](auto dtype) {
+        headdim_dispatch(headdim, [&](auto headdim) {
+            using kDtype = decltype(dtype)::type;
+            constexpr auto kHeaddim = decltype(headdim)::value;
+            run_flash_attention<kDtype, kHeaddim>(params);
+        });
+    });
     return o;
 }
 
