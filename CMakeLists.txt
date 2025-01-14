@@ -9,10 +9,8 @@ set(INCLUDE_DIRS
     "${CMAKE_SOURCE_DIR}/3rd/cutlass/include"
     "${CMAKE_SOURCE_DIR}/include"
 )
-set(SOURCES
-    src/flash_attention.cu
-    src/flash_attention_api.cpp
-)
+
+file(GLOB_RECURSE SOURCES "${CMAKE_SOURCE_DIR}/src/*.cu" "${CMAKE_SOURCE_DIR}/src/*.cpp")
 
 set(DEFS
     -D__CUDA_NO_HALF_OPERATORS__
