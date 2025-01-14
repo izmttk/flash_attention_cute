@@ -11,6 +11,7 @@ set(INCLUDE_DIRS
 )
 
 file(GLOB_RECURSE SOURCES "${CMAKE_SOURCE_DIR}/src/*.cu" "${CMAKE_SOURCE_DIR}/src/*.cpp")
+file(GLOB_RECURSE HEADERS "${CMAKE_SOURCE_DIR}/src/*.cuh" "${CMAKE_SOURCE_DIR}/src/*.h" "${CMAKE_SOURCE_DIR}/src/*.hpp")
 
 set(DEFS
     -D__CUDA_NO_HALF_OPERATORS__
@@ -47,28 +48,11 @@ else()
 endif()
 find_package(Torch REQUIRED)
 
-foreach(SOURCE ${SOURCES})
-    get_filename_component(SOURCE_NAME ${SOURCE} NAME_WE)
-    add_executable(${SOURCE_NAME} ${SOURCE})
-    target_compile_options(${SOURCE_NAME} PRIVATE -lineinfo -expt-relaxed-constexpr)
-    target_include_directories(${SOURCE_NAME} PRIVATE ${INCLUDE_DIRS})
-    target_compile_definitions(${SOURCE_NAME} PRIVATE ${DEFS})
-
-    target_link_libraries(${SOURCE_NAME} ${TORCH_LIBRARIES} Python::Python)
-    target_include_directories(${SOURCE_NAME} PRIVATE ${TORCH_INCLUDE_DIRS})
-
-    get_source_file_property(FILE_LANGUAGE ${SOURCE} LANGUAGE)
-    if (FILE_LANGUAGE STREQUAL "CUDA" AND MSVC)
-        target_link_options(${SOURCE_NAME} PRIVATE /NODEFAULTLIB:LIBCMT)
-        target_compile_options(${SOURCE_NAME} PRIVATE "-Xcompiler=\"/utf-8\"")
-    endif()
-    # add a run command, usage: cmake --build . --target run_filename
-    # add_custom_target(run_${SOURCE_NAME}
-    #     COMMAND ${SOURCE_NAME}
-    #     DEPENDS ${SOURCE_NAME}
-    #     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    # )
-endforeach()
+set(LIB_NAME flash_attention)
+add_library(${LIB_NAME} ${SOURCES} ${HEADERS})
+target_link_libraries(${LIB_NAME} ${TORCH_LIBRARIES} Python::Python)
+target_include_directories(${LIB_NAME} PRIVATE ${INCLUDE_DIRS})
+target_compile_definitions(${LIB_NAME} PRIVATE ${DEFS})
 
 option(ENABLE_EXAMPLES "Enable examples" ON)
 if (ENABLE_EXAMPLES)

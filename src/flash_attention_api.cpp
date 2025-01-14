@@ -1,7 +1,7 @@
 #include <torch/extension.h>
 #include <torch/types.h>
 #include <cutlass/numeric_types.h>
-#include "flash_attention.cuh"
+#include "flash_attention.h"
 
 template <typename T>
 struct ConstantType {
@@ -28,7 +28,7 @@ void dtype_dispatch(torch::ScalarType dtype, Callback func) {
     }
 }
 
-torch::Tensor flash_attention_v2_cute(
+torch::Tensor flash_attention_fwd(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, float softmax_scale) {
 
     // Check input shape
@@ -115,6 +115,6 @@ torch::Tensor flash_attention_v2_cute(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // m.def("package_name", &function_name, "function_docstring"")
-    m.def("flash_attention_v2_cute", &flash_attention_v2_cute,
+    m.def("flash_attention_fwd", &flash_attention_fwd,
           "Flash attention v2 implement in cutlass cute");
 }

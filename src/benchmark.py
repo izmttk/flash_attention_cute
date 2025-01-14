@@ -67,7 +67,7 @@ def flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale:
     q = q.contiguous() if q.stride(3) != -1 else q
     k = k.contiguous() if k.stride(3) != -1 else k
     v = v.contiguous() if v.stride(3) != -1 else v
-    attn = flash_attention_ext.flash_attention_v2_cute(q, k, v, softmax_scale)
+    attn = flash_attention_ext.flash_attention_fwd(q, k, v, softmax_scale)
     if need_padding:
         attn = attn[:, :, :, :head_dim]
     return attn

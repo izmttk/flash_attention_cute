@@ -2,7 +2,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include "flash_attention.cuh"
+#include "flash_attention.h"
 #include <cute/tensor.hpp>
 #define WARP_SIZE 32
 
@@ -153,7 +153,8 @@ CUTE_HOST_DEVICE constexpr auto convert_layout_partition_C_to_A(Layout const& c_
 // 向量化访存 128bit 是沿着 head dim 方向进行的，所以只需要确保 head_dim 大小是 8 的倍数即可（对于半精度数据而言）
 // 同时在内存连续性上，只要求最后一维，即 head dim 连续即可，即 stride 为 1，其他的维度通过参数中的各自 stride 来控制
 template<typename T, int kBlockM, int kBlockN, int kHeadDim, int kNWarps>
-__global__ void flash_attention_v2(FlashAttentionParams params) {
+// https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#grid-constant
+__global__ void flash_attention_v2(const FlashAttentionParams params) {
     using namespace cute;
 
     constexpr int kNThreads = kNWarps * WARP_SIZE;
@@ -563,7 +564,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
 
 
 template <typename T, int kBlockM, int kBlockN, int kHeadDim, int kNWarps>
-void launch_flash_attention(FlashAttentionParams params) {
+void launch_flash_attention(FlashAttentionParams &params) {
     constexpr int kNThreads = kNWarps * WARP_SIZE;
     int num_q_tiles = cute::ceil_div(params.q_seqlen, kBlockM);
     dim3 grid(num_q_tiles, params.num_heads, params.batch_size);
