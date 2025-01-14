@@ -61,6 +61,24 @@ __forceinline__ __device__ void copy(
     }
 }
 
+template<typename T, const int Threads>
+__device__ __forceinline__ T warp_reduce_max(T val) {
+    CUTE_UNROLL
+    for (int offset = Threads / 2 ; offset > 0; offset /= 2) {
+        val = max(val, __shfl_xor_sync(0xffffffff, val, offset));
+    }
+    return val;
+}
+
+template<typename T, const int Threads>
+__device__ __forceinline__ T warp_reduce_sum(T val) {
+    CUTE_UNROLL
+    for (int offset = Threads / 2 ; offset > 0; offset /= 2) {
+        val += __shfl_xor_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
 template<class TiledMMA, class TVCrd, class MNCrd>
 CUTE_HOST_DEVICE constexpr auto tv2crd_C(
     TiledMMA const& tiled_mma,
@@ -445,11 +463,8 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
             for (int col = 0; col < size<1>(rS_2d); col++) {
                 new_rowmax = max(new_rowmax, rS_2d(row, col));
             }
-            constexpr int num_threads_per_col = 4;
-            CUTE_UNROLL
-            for (int offset = num_threads_per_col / 2; offset > 0; offset /= 2) {
-                new_rowmax = max(new_rowmax, __shfl_xor_sync(0xffffffff, new_rowmax, offset));
-            }
+            constexpr int threads_col = 4;
+            new_rowmax = warp_reduce_max<float, threads_col>(new_rowmax);
             // 因为求一行的最大值的时候，S没有进行缩放，所以这里要缩放一下
             float scores_scale = expf((prev_rowmax - new_rowmax) * params.softmax_scale);
             prev_rowmax = new_rowmax;
@@ -462,7 +477,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
 
             CUTE_UNROLL
             for (int col = 0; col < size<1>(rS_2d); col++) {
-                rS_2d(row, col) = rS_2d(row, col) == -FLT_MAX ? 0 : expf((rS_2d(row, col) - new_rowmax) * params.softmax_scale);
+                rS_2d(row, col) = rS_2d(row, col) == -FLT_MAX ? 0.0f : expf((rS_2d(row, col) - new_rowmax) * params.softmax_scale);
             }
 
             float& prev_rowsum = scores_sum(row);
@@ -471,10 +486,7 @@ __global__ void flash_attention_v2(FlashAttentionParams params) {
             for (int col = 0; col < size<1>(rS_2d); col++) {
                 new_rowsum += rS_2d(row, col);
             }
-            CUTE_UNROLL
-            for (int offset = num_threads_per_col / 2; offset > 0; offset /= 2) {
-                new_rowsum += __shfl_xor_sync(0xffffffff, new_rowsum, offset);
-            }
+            new_rowsum = warp_reduce_sum<float, threads_col>(new_rowsum);
             prev_rowsum = scores_scale * prev_rowsum + new_rowsum;
         }
 
