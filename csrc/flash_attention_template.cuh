@@ -4,12 +4,16 @@
 
 #include "flash_attention.h"
 #include <cute/tensor.hpp>
-#define WARP_SIZE 32
 
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
+
+namespace flash_attention {
+
+#define WARP_SIZE 32
+
 template <typename To_type, typename Engine, typename Layout>
 __forceinline__ __device__ auto convert_type(cute::Tensor<Engine, Layout> const &tensor) {
     using From_type = typename Engine::value_type;
@@ -573,3 +577,5 @@ void launch_flash_attention(FlashAttentionParams &params) {
     flash_attention_func<<<grid, block>>>(params);
     CUDA_ERROR_CHECK(cudaGetLastError());
 }
+
+} // namespace flash_attention

@@ -3,6 +3,8 @@
 #include <cutlass/numeric_types.h>
 #include "flash_attention.h"
 
+namespace flash_attention {
+
 template <typename T>
 struct ConstantType {
     using type = T;
@@ -115,6 +117,8 @@ torch::Tensor flash_attention_fwd(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // m.def("package_name", &function_name, "function_docstring"")
-    m.def("flash_attention_fwd", &flash_attention_fwd,
+    m.def("flash_attention_fwd", &flash_attention::flash_attention_fwd,
           "Flash attention v2 implement in cutlass cute");
 }
+
+} // namespace flash_attention

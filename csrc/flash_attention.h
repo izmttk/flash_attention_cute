@@ -1,6 +1,8 @@
 #pragma once
 #include <cuda.h>
 
+namespace flash_attention {
+
 struct FlashAttentionParams {
     // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#restrict
     void* __restrict__ q_ptr;
@@ -45,3 +47,5 @@ void run_flash_attention(FlashAttentionParams &params);
       exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
+
+} // namespace flash_attention

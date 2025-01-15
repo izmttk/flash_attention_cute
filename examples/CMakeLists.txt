@@ -6,8 +6,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(STANDARD 17) # only c++17 is supported?
 set(SM_ARCH 80)
 set(INCLUDE_DIRS
-    "${CMAKE_SOURCE_DIR}/3rd/cutlass/include"
-    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/../csrc/3rd/cutlass/include"
+    "${CMAKE_SOURCE_DIR}/../csrc/3rd/cutlass/tools/util/include"
 )
 set(SOURCES
     sgemm_1.cu

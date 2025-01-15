@@ -7,11 +7,11 @@ set(STANDARD 17) # only c++17 is supported?
 set(SM_ARCH 80)
 set(INCLUDE_DIRS
     "${CMAKE_SOURCE_DIR}/3rd/cutlass/include"
-    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/3rd/cutlass/tools/util/include"
 )
 
-file(GLOB_RECURSE SOURCES "${CMAKE_SOURCE_DIR}/src/*.cu" "${CMAKE_SOURCE_DIR}/src/*.cpp")
-file(GLOB_RECURSE HEADERS "${CMAKE_SOURCE_DIR}/src/*.cuh" "${CMAKE_SOURCE_DIR}/src/*.h" "${CMAKE_SOURCE_DIR}/src/*.hpp")
+file(GLOB_RECURSE SOURCES "${CMAKE_SOURCE_DIR}/*.cu" "${CMAKE_SOURCE_DIR}/*.cpp")
+file(GLOB_RECURSE HEADERS "${CMAKE_SOURCE_DIR}/*.cuh" "${CMAKE_SOURCE_DIR}/*.h" "${CMAKE_SOURCE_DIR}/*.hpp")
 
 set(DEFS
     -D__CUDA_NO_HALF_OPERATORS__
@@ -53,8 +53,3 @@ add_library(${LIB_NAME} ${SOURCES} ${HEADERS})
 target_link_libraries(${LIB_NAME} ${TORCH_LIBRARIES} Python::Python)
 target_include_directories(${LIB_NAME} PRIVATE ${INCLUDE_DIRS})
 target_compile_definitions(${LIB_NAME} PRIVATE ${DEFS})
-
-option(ENABLE_EXAMPLES "Enable examples" ON)
-if (ENABLE_EXAMPLES)
-  add_subdirectory(examples)
-endif()

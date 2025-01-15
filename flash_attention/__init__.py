@@ -1,0 +1,1 @@
+from .flash_attention import flash_attn_func
