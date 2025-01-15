@@ -10,8 +10,8 @@ set(INCLUDE_DIRS
     "${CMAKE_SOURCE_DIR}/3rd/cutlass/tools/util/include"
 )
 
-file(GLOB_RECURSE SOURCES "${CMAKE_SOURCE_DIR}/*.cu" "${CMAKE_SOURCE_DIR}/*.cpp")
-file(GLOB_RECURSE HEADERS "${CMAKE_SOURCE_DIR}/*.cuh" "${CMAKE_SOURCE_DIR}/*.h" "${CMAKE_SOURCE_DIR}/*.hpp")
+file(GLOB SOURCES "${CMAKE_SOURCE_DIR}/*.cu" "${CMAKE_SOURCE_DIR}/*.cpp")
+file(GLOB HEADERS "${CMAKE_SOURCE_DIR}/*.cuh" "${CMAKE_SOURCE_DIR}/*.h" "${CMAKE_SOURCE_DIR}/*.hpp")
 
 set(DEFS
     -D__CUDA_NO_HALF_OPERATORS__
