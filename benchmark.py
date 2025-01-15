@@ -81,6 +81,9 @@ def benchmark(iter = 100):
     print("MSE(ours, official):", mse(o_ours, o_official).item())
     print("Allclose(ours, official):", torch.allclose(o_ours, o_official, atol=1e-3))
 
+    print("MSE(pytorch, official):", mse(o_pytorch, o_official).item())
+    print("Allclose(pytorch, official):", torch.allclose(o_pytorch, o_official, atol=1e-3))
+
     # print(o_ours)
     # print(o_pytorch)
     # print(o_official)
