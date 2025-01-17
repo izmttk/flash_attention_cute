@@ -11,10 +11,13 @@ struct FlashAttentionParams {
     void* __restrict__ o_ptr;
 
     int64_t batch_size;
-    int64_t num_heads;
-    int64_t q_seqlen;
-    int64_t kv_seqlen;
+    int64_t num_heads_q;
+    int64_t num_heads_kv;
+    int64_t seqlen_q;
+    int64_t seqlen_kv;
     int64_t headdim;
+
+    int64_t head_q_per_group;
 
     int64_t q_batch_stride;
     int64_t k_batch_stride;

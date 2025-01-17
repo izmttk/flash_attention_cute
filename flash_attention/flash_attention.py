@@ -52,5 +52,4 @@ def flash_attn_func(q, k, v, softmax_scale=None):
     return torch.ops.flash_attention.forward(q, k, v, softmax_scale)
 
 
-# TODO: support GQA and MQA
 # TODO: support causal mask

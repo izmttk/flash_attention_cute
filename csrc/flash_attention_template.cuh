@@ -48,6 +48,8 @@ __forceinline__ __device__ void copy(
 ) {
     using namespace cute;
     // copy(tiled_copy, src, dst);
+    // 不要轻易使用 cute::print 打印 Tensor，这玩意会引起包括 msialigned address,  illegal memory access 等一系列奇怪的问题
+    // 仅限 Windows 平台，cutlass <= 3.6.0，其他平台未测试，有可能是 cutlass 的 bug，暂时没有头绪
     CUTE_UNROLL
     for (int m = 0; m < size<1>(src); m++) {
         if (get<0>(identity(0, m, 0)) < get<0>(max_mn)) {
@@ -145,13 +147,10 @@ CUTE_HOST_DEVICE constexpr auto convert_layout_partition_C_to_A(Layout const& c_
     return layout_a;
 }
 
-//  query: [batch_size, num_heads,  q_seqlen, qk_headdim]
-//    key: [batch_size, num_heads, kv_seqlen, qk_headdim]
-//  score: [batch_size, num_heads,  q_seqlen,  kv_seqlen]
-//  value: [batch_size, num_heads, kv_seqlen,  v_headdim]
-// output: [batch_size, num_heads,  q_seqlen,  v_headdim]
-// rowmax: [batch_size, num_heads,  q_seqlen]
-// rowsum: [batch_size, num_heads,  q_seqlen]
+//  query: [batch_size,    num_heads,  seqlen_q, headdim]
+//    key: [batch_size, num_heads_kv, seqlen_kv, headdim]
+//  value: [batch_size, num_heads_kv,  seqlen_q, headdim]
+// output: [batch_size,    num_heads, seqlen_kv, headdim]
 
 // cuda 分配的内存默认 256 字节对齐，所以不需要担心指针不对齐向量访存大小的问题
 // 向量化访存 128bit 是沿着 head dim 方向进行的，所以只需要确保 head_dim 大小是 8 的倍数即可（对于半精度数据而言）
@@ -170,61 +169,31 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
     const int head = blockIdx.y;
     const int q_tile = blockIdx.x;
 
-    // Tensor mQ = make_tensor(
-    //     make_gmem_ptr(reinterpret_cast<half_t*>(params.q_ptr)),
-    //     make_shape(params.batch_size, params.num_heads, params.q_seqlen, params.headdim),
-    //     make_stride(params.q_batch_stride, params.q_head_stride, params.q_seqlen_stride, Int<1>{})
-    // );
-    // Tensor mK = make_tensor(
-    //     make_gmem_ptr(reinterpret_cast<half_t*>(params.k_ptr)),
-    //     make_shape(params.batch_size, params.num_heads, params.kv_seqlen, params.headdim),
-    //     make_stride(params.k_batch_stride, params.k_head_stride, params.k_seqlen_stride, Int<1>{})
-    // );
-    // Tensor mV = make_tensor(
-    //     make_gmem_ptr(reinterpret_cast<half_t*>(params.v_ptr)),
-    //     make_shape(params.batch_size, params.num_heads, params.kv_seqlen, params.headdim),
-    //     make_stride(params.v_batch_stride, params.v_head_stride, params.v_seqlen_stride, Int<1>{})
-    // );
-    // Tensor mO = make_tensor(
-    //     make_gmem_ptr(reinterpret_cast<half_t*>(params.o_ptr)),
-    //     make_shape(params.batch_size, params.num_heads, params.q_seqlen, params.headdim),
-    //     make_stride(params.o_batch_stride, params.o_head_stride, params.o_seqlen_stride, Int<1>{})
-    // );
-
     // // 1. gmem, smem Tensor 的定义，需要：
     // // gmem global Tensor
     // // gmem tiled Tensor
     // // smem Tensor
 
-    // // Q: (q_seqlen, qk_headdim)
-    // Tensor Q = mQ(batch, head, _, _);
-    // // K: (kv_seqlen, qk_headdim)
-    // Tensor K = mK(batch, head, _, _);
-    // // V: (kv_seqlen, v_headdim)
-    // Tensor V = mV(batch, head, _, _);
-    // // O: (q_seqlen, v_headdim)
-    // Tensor O = mO(batch, head, _, _);
-
     T *q_offset = reinterpret_cast<T*>(params.q_ptr) + batch * params.q_batch_stride + head * params.q_head_stride;
-    T *k_offset = reinterpret_cast<T*>(params.k_ptr) + batch * params.k_batch_stride + head * params.k_head_stride;
-    T *v_offset = reinterpret_cast<T*>(params.v_ptr) + batch * params.v_batch_stride + head * params.v_head_stride;
+    T *k_offset = reinterpret_cast<T*>(params.k_ptr) + batch * params.k_batch_stride + (head / params.head_q_per_group) * params.k_head_stride;
+    T *v_offset = reinterpret_cast<T*>(params.v_ptr) + batch * params.v_batch_stride + (head / params.head_q_per_group) * params.v_head_stride;
     T *o_offset = reinterpret_cast<T*>(params.o_ptr) + batch * params.o_batch_stride + head * params.o_head_stride;
 
-    Tensor mQ = make_tensor(make_gmem_ptr(q_offset), make_layout(make_shape(params.q_seqlen, params.headdim), make_stride(params.q_seqlen_stride, Int<1>{})));
-    Tensor mK = make_tensor(make_gmem_ptr(k_offset), make_layout(make_shape(params.kv_seqlen, params.headdim), make_stride(params.k_seqlen_stride, Int<1>{})));
-    Tensor mV = make_tensor(make_gmem_ptr(v_offset), make_layout(make_shape(params.kv_seqlen, params.headdim), make_stride(params.v_seqlen_stride, Int<1>{})));
-    Tensor mO = make_tensor(make_gmem_ptr(o_offset), make_layout(make_shape(params.q_seqlen, params.headdim), make_stride(params.o_seqlen_stride, Int<1>{})));
+    Tensor mQ = make_tensor(make_gmem_ptr(q_offset), make_layout(make_shape(params.seqlen_q, params.headdim), make_stride(params.q_seqlen_stride, Int<1>{})));
+    Tensor mK = make_tensor(make_gmem_ptr(k_offset), make_layout(make_shape(params.seqlen_kv, params.headdim), make_stride(params.k_seqlen_stride, Int<1>{})));
+    Tensor mV = make_tensor(make_gmem_ptr(v_offset), make_layout(make_shape(params.seqlen_kv, params.headdim), make_stride(params.v_seqlen_stride, Int<1>{})));
+    Tensor mO = make_tensor(make_gmem_ptr(o_offset), make_layout(make_shape(params.seqlen_q, params.headdim), make_stride(params.o_seqlen_stride, Int<1>{})));
 
     // gQ 是固定的 Q 的第 q_tile 个分块
-    // gQ: (kBlockM, qk_headdim, num_tile_qk_headdim) = (64, qk_headdim, 1)
-    Tensor gQ = local_tile(mQ, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(q_tile, _));
-    // gK, gV 会在 tile 迭代时更新，这里预取第一个 Q、K tile
-    // gK: (kBlockN, qk_headdim, num_tile_qk_headdim) = (64, qk_headdim, 1)
-    Tensor gK = local_tile(mK, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _));
-    // gV: (kBlockN, v_headdim, num_tile_v_headdim) = (64, v_headdim, 1)
-    Tensor gV = local_tile(mV, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _));
-    // gO: (kBlockM, v_headdim, num_tile_v_headdim) = (64, v_headdim, 1)
-    Tensor gO = local_tile(mO, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(q_tile, _));
+    // gQ: (kBlockM, kHeadDim)
+    Tensor gQ = local_tile(mQ, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(q_tile, 0));
+    // gK, gV 会在 tile 迭代时更新
+    // gK: (kBlockN, kHeadDim, nTile)
+    Tensor gK = local_tile(mK, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(_, 0));
+    // gV: (kBlockN, kHeadDim, nTile)
+    Tensor gV = local_tile(mV, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(_, 0));
+    // gO: (kBlockM, kHeadDim)
+    Tensor gO = local_tile(mO, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(q_tile, 0));
 
     // TODO: 需要 Swizzle 优化
     // 一个可以一行或一列完全 bank conflict free 的布局，8x64
@@ -286,11 +255,11 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{} // value layout
     );
     ThrCopy gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_slice(threadIdx.x);
-    Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ(_, _, 0));
+    Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
     Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
-    Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK(_, _, 0));
+    Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK);
     Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
-    Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
+    Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);
     Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
 
     Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);
@@ -359,12 +328,12 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
     Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
     Tensor tOrVt_copy_view = smem_thr_copy_V.retile_D(tOrVt);
 
-    copy(gmem_tiled_copy_QKV, tQcQ, make_tuple(params.q_seqlen - q_tile * kBlockM, params.headdim), tQgQ, tQsQ);
+    copy(gmem_tiled_copy_QKV, tQcQ, make_tuple(params.seqlen_q - q_tile * kBlockM, params.headdim), tQgQ, tQsQ);
     // cp_async_fence();
     // cp_async_wait<0>();
     // __syncthreads();
 
-    copy(gmem_tiled_copy_QKV, tKVcKV, make_tuple(params.kv_seqlen - 0 * kBlockN, params.headdim), tKgK, tKsK);
+    copy(gmem_tiled_copy_QKV, tKVcKV, make_tuple(params.seqlen_kv - 0 * kBlockN, params.headdim), tKgK(_, _, _, 0), tKsK);
     cp_async_fence();
 
     clear(rAccO);
@@ -380,20 +349,16 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
     fill(scores_max, -FLT_MAX);
     fill(scores_sum, 0.0f);
 
-    const int n_blocks = ceil_div(params.kv_seqlen, kBlockN);
+    const int n_blocks = ceil_div(params.seqlen_kv, kBlockN);
     for (int block = 0; block < n_blocks; block++) {
         clear(rAccS);
-
 
         // 等待 K gmem 到 smem 的拷贝完成
         cp_async_wait<0>();
         __syncthreads();
 
         // 复制接下来将要用到的 V 到 smem
-        gV = local_tile(mV, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(block, _));
-        tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
-
-        copy(gmem_tiled_copy_QKV, tKVcKV, make_tuple(params.kv_seqlen - block * kBlockN, params.headdim), tVgV, tVsV);
+        copy(gmem_tiled_copy_QKV, tKVcKV, make_tuple(params.seqlen_kv - block * kBlockN, params.headdim), tVgV(_, _, _, block), tVsV);
         cp_async_fence();
 
         // S = Q * K^T
@@ -416,10 +381,7 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
         // 复制下一个 block 的 K 到 smem
         if (block != n_blocks - 1) {
             // 更新 gK tKgK 指向下一个 K block，并进行复制
-            gK = local_tile(mK, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(block + 1, _));
-            tKgK = gmem_thr_copy_QKV.partition_S(gK(_, _, 0));
-
-            copy(gmem_tiled_copy_QKV, tKVcKV, make_tuple(params.kv_seqlen - (block + 1) * kBlockN, params.headdim), tKgK, tKsK);
+            copy(gmem_tiled_copy_QKV, tKVcKV, make_tuple(params.seqlen_kv - (block + 1) * kBlockN, params.headdim), tKgK(_, _, _, block + 1), tKsK);
             cp_async_fence();
         }
 
@@ -434,7 +396,7 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
                     auto crd = tv2crd_C(tiled_mma, make_coord(threadIdx.x, v), make_coord(m, n));
                     const int real_m = q_tile * kBlockM + get<0>(crd);
                     const int real_n = block * kBlockN + get<1>(crd);
-                    if (real_m >= params.q_seqlen || real_n >= params.kv_seqlen) {
+                    if (real_m >= params.seqlen_q || real_n >= params.seqlen_kv) {
                         rAccS(v, m, n) = -FLT_MAX;
                     }
                 }
@@ -556,21 +518,21 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
     );
     ThrCopy gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(threadIdx.x);
     Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
-    Tensor tOgO = gmem_thr_copy_O.partition_D(gO(_, _, 0));
+    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
     __syncthreads();
 
     Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
 
     // 最后复制 O 到 gmem 时，要关闭 IsClearOOB，因为 mO 的尺寸不一定等于 gO，会有值被覆盖为 0 的情况
-    copy<false>(gmem_tiled_copy_O, tOcO, make_tuple(params.q_seqlen - q_tile * kBlockM, params.headdim), tOsO, tOgO);
+    copy<false>(gmem_tiled_copy_O, tOcO, make_tuple(params.seqlen_q - q_tile * kBlockM, params.headdim), tOsO, tOgO);
 }
 
 
 template <typename T, int kBlockM, int kBlockN, int kHeadDim, int kNWarps>
 void launch_flash_attention(FlashAttentionParams &params) {
     constexpr int kNThreads = kNWarps * WARP_SIZE;
-    int num_q_tiles = cute::ceil_div(params.q_seqlen, kBlockM);
-    dim3 grid(num_q_tiles, params.num_heads, params.batch_size);
+    int num_q_tiles = cute::ceil_div(params.seqlen_q, kBlockM);
+    dim3 grid(num_q_tiles, params.num_heads_q, params.batch_size);
     dim3 block(kNThreads);
     auto flash_attention_func = flash_attention_v2<T, kBlockM, kBlockN, kHeadDim, kNWarps>;
     flash_attention_func<<<grid, block>>>(params);
