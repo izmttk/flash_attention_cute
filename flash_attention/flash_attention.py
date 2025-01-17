@@ -50,3 +50,7 @@ def flash_attn_func(q, k, v, softmax_scale=None):
     # softmax_scale: float
     softmax_scale = (q.size(-1) ** -0.5) if softmax_scale is None else softmax_scale
     return torch.ops.flash_attention.forward(q, k, v, softmax_scale)
+
+
+# TODO: support GQA and MQA
+# TODO: support causal mask

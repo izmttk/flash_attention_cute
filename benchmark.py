@@ -5,7 +5,6 @@ from flash_attention import flash_attn_func as flash_attn_custom
 
 torch.set_grad_enabled(False)
 
-
 def flash_attention_custom(q, k, v, softmax_scale=None):
     return flash_attn_custom(q, k, v, softmax_scale=softmax_scale)
 
@@ -19,19 +18,21 @@ def flash_attention_official(q, k, v, softmax_scale=None):
     attn = attn.permute(0, 2, 1, 3)
     return attn
 
+from torch.nn.functional import scaled_dot_product_attention
+from torch.nn.attention import SDPBackend, sdpa_kernel
 def sdpa(query, key, value, softmax_scale=None, mask=None):
     # query: [batch_size, n_heads, seq_len, d_k]
-    query = query.float()
-    key = key.float()
-    value = value.float()
-    scale_factor = (query.size(-1) ** -0.5) if softmax_scale is None else softmax_scale
-    scores = torch.matmul(query, key.transpose(-2, -1)) * scale_factor
-    # print(select_thrCreg_SM80_16x8x16_F16F16F16F16_TN(torch.matmul(query, key.transpose(-2, -1))[0, 0, :, :], 0))
-    if mask is not None:
-        scores = scores.masked_fill(mask == 0, float('-inf'))
-    attn = torch.softmax(scores, dim=-1)
-    attn = torch.matmul(attn, value)
-    return attn.half()
+    # scale_factor = (query.size(-1) ** -0.5) if softmax_scale is None else softmax_scale
+    # scores = torch.matmul(query, key.transpose(-2, -1)) * scale_factor
+    # # print(select_thrCreg_SM80_16x8x16_F16F16F16F16_TN(torch.matmul(query, key.transpose(-2, -1))[0, 0, :, :], 0))
+    # if mask is not None:
+    #     scores = scores.masked_fill(mask == 0, float('-inf'))
+    # attn = torch.softmax(scores, dim=-1, dtype=torch.float)
+    # attn = torch.matmul(attn.to(value.dtype), value)
+    # return attn
+    with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+        attn = scaled_dot_product_attention(query, key, value, attn_mask=mask, scale=softmax_scale)
+    return attn
 
 def mse(a, b):
     a = a.float()

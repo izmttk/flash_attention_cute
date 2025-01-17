@@ -360,9 +360,9 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
     Tensor tOrVt_copy_view = smem_thr_copy_V.retile_D(tOrVt);
 
     copy(gmem_tiled_copy_QKV, tQcQ, make_tuple(params.q_seqlen - q_tile * kBlockM, params.headdim), tQgQ, tQsQ);
-    cp_async_fence();
-    cp_async_wait<0>();
-    __syncthreads();
+    // cp_async_fence();
+    // cp_async_wait<0>();
+    // __syncthreads();
 
     copy(gmem_tiled_copy_QKV, tKVcKV, make_tuple(params.kv_seqlen - 0 * kBlockN, params.headdim), tKgK, tKsK);
     cp_async_fence();
@@ -394,7 +394,6 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
         tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
 
         copy(gmem_tiled_copy_QKV, tKVcKV, make_tuple(params.kv_seqlen - block * kBlockN, params.headdim), tVgV, tVsV);
-
         cp_async_fence();
 
         // S = Q * K^T
@@ -471,7 +470,7 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
             constexpr int threads_col = 4;
             new_rowmax = warp_reduce_max<float, threads_col>(new_rowmax);
             // 因为求一行的最大值的时候，S没有进行缩放，所以这里要缩放一下
-            float scores_scale = expf((prev_rowmax - new_rowmax) * params.softmax_scale);
+            float scores_scale = exp2f((prev_rowmax - new_rowmax) * params.softmax_scale);
             prev_rowmax = new_rowmax;
 
             // 缩放 O
@@ -482,7 +481,7 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
 
             CUTE_UNROLL
             for (int col = 0; col < size<1>(rS_2d); col++) {
-                rS_2d(row, col) = rS_2d(row, col) == -FLT_MAX ? 0.0f : expf((rS_2d(row, col) - new_rowmax) * params.softmax_scale);
+                rS_2d(row, col) = rS_2d(row, col) == -FLT_MAX ? 0.0f : exp2f((rS_2d(row, col) - new_rowmax) * params.softmax_scale);
             }
 
             float& prev_rowsum = scores_sum(row);
@@ -526,7 +525,7 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
     Tensor rO_2d = make_tensor(rAccO.data(), layout_rAccO_2d);
     CUTE_UNROLL
     for (int row = 0; row < size<0>(rO_2d); row++) {
-        float scale = scores_sum(row) == 0 ? 1 : 1 / scores_sum(row);
+        float scale = scores_sum(row) == 0.0f ? 1.0f : 1.0f / scores_sum(row);
         CUTE_UNROLL
         for (int col = 0; col < size<1>(rO_2d); col++) {
             rO_2d(row, col) *= scale;

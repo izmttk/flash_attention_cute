@@ -31,7 +31,7 @@ void dtype_dispatch(torch::ScalarType dtype, Callback func) {
 }
 
 torch::Tensor flash_attention_fwd(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, float softmax_scale) {
+    torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, float softmax_scale) {
 
     // Check input shape
     TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0),
@@ -67,14 +67,15 @@ torch::Tensor flash_attention_fwd(
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
                 "q, k, v must be on CUDA device");
 
-    int bs = q.size(0);
-    int head = q.size(1);
-    int q_seqlen = q.size(2);
-    int kv_seqlen = k.size(2);
-    int headdim = q.size(3);
+    int64_t bs = q.size(0);
+    int64_t head = q.size(1);
+    int64_t q_seqlen = q.size(2);
+    int64_t kv_seqlen = k.size(2);
+    int64_t headdim = q.size(3);
 
     auto o = torch::empty({bs, head, q_seqlen, headdim}, q.options());
 
+    softmax_scale *= M_LOG2E;
     FlashAttentionParams params = {
         q.data_ptr(),
         k.data_ptr(),
@@ -100,11 +101,6 @@ torch::Tensor flash_attention_fwd(
         softmax_scale
     };
 
-    // AT_DISPATCH_SWITCH(q.scalar_type(), "flash_attention_v2_cute",
-    //     AT_DISPATCH_CASE(c10::kHalf, [&] {
-    //         launch_flash_attention_v2(params);
-    //     })
-    // );
     dtype_dispatch(q.scalar_type(), [&](auto dtype) {
         headdim_dispatch(headdim, [&](auto headdim) {
             using kDtype = decltype(dtype)::type;
