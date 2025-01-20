@@ -31,7 +31,7 @@ void dtype_dispatch(torch::ScalarType dtype, Callback func) {
 }
 
 torch::Tensor flash_attention_fwd(
-    torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, float softmax_scale) {
+    torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, float softmax_scale, bool causal) {
 
     // Check input shape
     TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0),
@@ -88,6 +88,7 @@ torch::Tensor flash_attention_fwd(
     if (is_pack_head_q) {
         head_q = head_kv;
         seqlen_q = seqlen_q * head_q_per_group;
+        causal = false;
         q = q.reshape({bs, head_q, seqlen_q, headdim});
     }
 
@@ -125,7 +126,11 @@ torch::Tensor flash_attention_fwd(
         headdim_dispatch(headdim, [&](auto headdim) {
             using kDtype = decltype(dtype)::type;
             constexpr auto kHeaddim = decltype(headdim)::value;
-            run_flash_attention<kDtype, kHeaddim>(params);
+            if (causal) {
+                run_flash_attention<kDtype, kHeaddim, true>(params);
+            } else {
+                run_flash_attention<kDtype, kHeaddim, false>(params);
+            }
         });
     });
 

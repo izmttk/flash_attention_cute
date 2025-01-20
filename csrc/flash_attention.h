@@ -37,7 +37,7 @@ struct FlashAttentionParams {
     float softmax_scale;
 };
 
-template <typename T, int kHeaddim>
+template <typename T, int kHeaddim, bool IsCausal>
 void run_flash_attention(FlashAttentionParams &params);
 
 #define CUDA_ERROR_CHECK(condition)                                            \

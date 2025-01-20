@@ -5,22 +5,22 @@ from flash_attention import flash_attn_func as flash_attn_custom
 
 torch.set_grad_enabled(False)
 
-def flash_attention_custom(q, k, v, softmax_scale=None):
-    return flash_attn_custom(q, k, v, softmax_scale=softmax_scale)
+def flash_attention_custom(q, k, v, softmax_scale=None, is_causal=False):
+    return flash_attn_custom(q, k, v, softmax_scale=softmax_scale, causal=is_causal)
 
-def flash_attention_official(q, k, v, softmax_scale=None):
+def flash_attention_official(q, k, v, softmax_scale=None, is_causal=False):
     # reshape from [batch_size, n_heads, seq_len, d] to [batch_size, seq_len, n_heads, d]
     q = q.permute(0, 2, 1, 3)
     k = k.permute(0, 2, 1, 3)
     v = v.permute(0, 2, 1, 3)
-    attn = flash_attn_official(q, k, v, softmax_scale=softmax_scale)
+    attn = flash_attn_official(q, k, v, softmax_scale=softmax_scale, causal=is_causal)
     # reshape back to [batch_size, n_heads, seq_len, d]
     attn = attn.permute(0, 2, 1, 3)
     return attn
 
 from torch.nn.functional import scaled_dot_product_attention
 from torch.nn.attention import SDPBackend, sdpa_kernel
-def sdpa(query, key, value, softmax_scale=None, mask=None):
+def sdpa(query, key, value, softmax_scale=None, is_causal=False):
     # scale_factor = (query.size(-1) ** -0.5) if softmax_scale is None else softmax_scale
     # scores = torch.matmul(query, key.transpose(-2, -1)) * scale_factor
     # # print(select_thrCreg_SM80_16x8x16_F16F16F16F16_TN(torch.matmul(query, key.transpose(-2, -1))[0, 0, :, :], 0))
@@ -29,8 +29,8 @@ def sdpa(query, key, value, softmax_scale=None, mask=None):
     # attn = torch.softmax(scores, dim=-1, dtype=torch.float)
     # attn = torch.matmul(attn.to(value.dtype), value)
     # return attn
-    with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
-        attn = scaled_dot_product_attention(query, key, value, attn_mask=mask, scale=softmax_scale)
+    with sdpa_kernel(SDPBackend.MATH):
+        attn = scaled_dot_product_attention(query, key, value, scale=softmax_scale, is_causal=is_causal)
     return attn
 
 def mse(a, b):
@@ -44,11 +44,11 @@ def benchmark(iter = 100):
     # num_heads_kv = 64 # Case for MHA
     num_heads_kv = 8 # Case for GQA
     # num_heads_kv = 1 # Case for MQA
-    # seqlen_q = 1024 # Case for prefilling stage
-    seqlen_q = 1 # Case for decoding stage
+    seqlen_q = 1024 # Case for prefilling stage
+    # seqlen_q = 1 # Case for decoding stage
     seqlen_kv = 1024
     dim = 128
-
+    is_causal = True
 
     q = torch.randn((bs, num_heads_q, seqlen_q, dim), dtype=torch.half, device="cuda")
     k = torch.randn((bs, num_heads_kv, seqlen_kv, dim), dtype=torch.half, device="cuda")
@@ -69,21 +69,21 @@ def benchmark(iter = 100):
     print("Q:", q.size(), q.stride())
     print("K:", k.size(), k.stride())
     print("V:", v.size(), v.stride())
-    o_ours = flash_attention_custom(q, k, v)
+    o_ours = flash_attention_custom(q, k, v, is_causal=is_causal)
     print("O(ours):", o_ours.size(), o_ours.stride())
-    o_pytorch = sdpa(q, k, v)
-    print("O(pytorch):", o_pytorch.size(), o_pytorch.stride())
-    o_official = flash_attention_official(q, k, v)
+    # o_pytorch = sdpa(q, k, v, is_causal=is_causal)
+    # print("O(pytorch):", o_pytorch.size(), o_pytorch.stride())
+    o_official = flash_attention_official(q, k, v, is_causal=is_causal)
     print("O(official):", o_official.size(), o_official.stride())
 
-    print("MSE(ours, pytorch):", mse(o_ours, o_pytorch).item())
-    print("Allclose(ours, pytorch):", torch.allclose(o_ours, o_pytorch, atol=1e-3))
+    # print("MSE(ours, pytorch):", mse(o_ours, o_pytorch).item())
+    # print("Allclose(ours, pytorch):", torch.allclose(o_ours, o_pytorch, atol=1e-3))
 
     print("MSE(ours, official):", mse(o_ours, o_official).item())
     print("Allclose(ours, official):", torch.allclose(o_ours, o_official, atol=1e-3))
 
-    print("MSE(pytorch, official):", mse(o_pytorch, o_official).item())
-    print("Allclose(pytorch, official):", torch.allclose(o_pytorch, o_official, atol=1e-3))
+    # print("MSE(pytorch, official):", mse(o_pytorch, o_official).item())
+    # print("Allclose(pytorch, official):", torch.allclose(o_pytorch, o_official, atol=1e-3))
 
     # print(o_ours)
     # print(o_pytorch)
@@ -91,26 +91,26 @@ def benchmark(iter = 100):
 
     start = time.time()
     for _ in range(iter):
-        o_ours = flash_attention_custom(q, k, v)
+        o_ours = flash_attention_custom(q, k, v, is_causal=is_causal)
     torch.cuda.synchronize()
     end = time.time()
     elapsed = (end - start) * 1e3
     print(f"Elapsed time (ours): {elapsed:.3f} ms")
     print(f"Time per iteration (ours): {elapsed / iter:.3f} ms")
 
-    start = time.time()
-    for _ in range(iter):
-        o_pytorch = sdpa(q, k, v)
-    torch.cuda.synchronize()
-    end = time.time()
-    elapsed = (end - start) * 1e3
-    print(f"Elapsed time (pytorch): {elapsed:.3f} ms")
-    print(f"Time per iteration (pytorch): {elapsed / iter:.3f} ms")
+    # start = time.time()
+    # for _ in range(iter):
+    #     o_pytorch = sdpa(q, k, v, is_causal=is_causal)
+    # torch.cuda.synchronize()
+    # end = time.time()
+    # elapsed = (end - start) * 1e3
+    # print(f"Elapsed time (pytorch): {elapsed:.3f} ms")
+    # print(f"Time per iteration (pytorch): {elapsed / iter:.3f} ms")
 
 
     start = time.time()
     for _ in range(iter):
-        o_official = flash_attention_official(q, k, v)
+        o_official = flash_attention_official(q, k, v, is_causal=is_causal)
     torch.cuda.synchronize()
     end = time.time()
     elapsed = (end - start) * 1e3

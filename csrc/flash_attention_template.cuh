@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include "flash_attention.h"
+#include "mask.cuh"
 #include <cute/tensor.hpp>
 
 #include <cutlass/array.h>
@@ -85,28 +86,6 @@ __device__ __forceinline__ T warp_reduce_sum(T val) {
     return val;
 }
 
-template<class TiledMMA, class TVCrd, class MNCrd>
-CUTE_HOST_DEVICE constexpr auto tv2crd_C(
-    TiledMMA const& tiled_mma,
-    TVCrd const& tv_crd,
-    MNCrd const& mn_crd = cute::Coord<cute::_0, cute::_0>{}
-) {
-    using namespace cute;
-    using AtomShapeMNK = typename TiledMMA::AtomShape_MNK;
-    auto ref_C = make_layout(make_shape(
-        size<1>(tiled_mma.get_thr_layout_vmnk()) * get<0>(AtomShapeMNK{}),
-        size<2>(tiled_mma.get_thr_layout_vmnk()) * get<1>(AtomShapeMNK{})
-    ));
-    auto layoutC_TV = tiled_mma.thrfrg_C(ref_C);
-    auto idx = layoutC_TV(tv_crd);
-    auto inner_crd = ref_C.get_flat_coord(idx);
-    auto crd = make_coord(
-        get<0>(inner_crd) + get<0>(mn_crd) * shape<0>(ref_C),
-        get<1>(inner_crd) + get<1>(mn_crd) * shape<1>(ref_C)
-    );
-    return crd;
-}
-
 template<class Layout>
 CUTE_HOST_DEVICE constexpr auto convert_layout_partition_C_to_2d(Layout const& c_layout) {
     // (MMA=4, MMA_M, MMA_N) to ((Tile=2, Rest=2), MMA_M, MMA_N)
@@ -155,7 +134,7 @@ CUTE_HOST_DEVICE constexpr auto convert_layout_partition_C_to_A(Layout const& c_
 // cuda 分配的内存默认 256 字节对齐，所以不需要担心指针不对齐向量访存大小的问题
 // 向量化访存 128bit 是沿着 head dim 方向进行的，所以只需要确保 head_dim 大小是 8 的倍数即可（对于半精度数据而言）
 // 同时在内存连续性上，只要求最后一维，即 head dim 连续即可，即 stride 为 1，其他的维度通过参数中的各自 stride 来控制
-template<typename T, int kBlockM, int kBlockN, int kHeadDim, int kNWarps>
+template<typename T, int kBlockM, int kBlockN, int kHeadDim, int kNWarps, bool IsCausal>
 // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#grid-constant
 __global__ void flash_attention_v2(const FlashAttentionParams params) {
     using namespace cute;
@@ -349,8 +328,17 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
     fill(scores_max, -FLT_MAX);
     fill(scores_sum, 0.0f);
 
+    Mask<kBlockM, kBlockN> mask(params.seqlen_q, params.seqlen_kv);
+
     const int n_blocks = ceil_div(params.seqlen_kv, kBlockN);
     for (int block = 0; block < n_blocks; block++) {
+        if constexpr (IsCausal) {
+            // causal mask 后，最后几个块是不需要计算的，直接跳过
+            if (mask.is_block_masked(q_tile, block)) {
+                continue;
+            }
+        }
+
         clear(rAccS);
 
         // 等待 K gmem 到 smem 的拷贝完成
@@ -387,21 +375,7 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
 
         // mask rAccS，越界的值置为 -FLT_MAX
         // 这种使用 layout 计算的方法比之前纯手写要慢 2% 左右
-        CUTE_UNROLL
-        for (int v = 0; v < size<0>(rAccS); v++) {
-            CUTE_UNROLL
-            for (int m = 0; m < size<1>(rAccS); m++) {
-                CUTE_UNROLL
-                for (int n = 0; n < size<2>(rAccS); n++) {
-                    auto crd = tv2crd_C(tiled_mma, make_coord(threadIdx.x, v), make_coord(m, n));
-                    const int real_m = q_tile * kBlockM + get<0>(crd);
-                    const int real_n = block * kBlockN + get<1>(crd);
-                    if (real_m >= params.seqlen_q || real_n >= params.seqlen_kv) {
-                        rAccS(v, m, n) = -FLT_MAX;
-                    }
-                }
-            }
-        }
+        mask.template apply<true, IsCausal>(tiled_mma, rAccS, q_tile, block, threadIdx.x);
 
         // softmax
         // rAccS: (MMA, MMA_M, MMA_N) = ((2, 2), 1, 8)
@@ -528,13 +502,13 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
 }
 
 
-template <typename T, int kBlockM, int kBlockN, int kHeadDim, int kNWarps>
+template <typename T, int kBlockM, int kBlockN, int kHeadDim, int kNWarps, bool IsCausal>
 void launch_flash_attention(FlashAttentionParams &params) {
     constexpr int kNThreads = kNWarps * WARP_SIZE;
     int num_q_tiles = cute::ceil_div(params.seqlen_q, kBlockM);
     dim3 grid(num_q_tiles, params.num_heads_q, params.batch_size);
     dim3 block(kNThreads);
-    auto flash_attention_func = flash_attention_v2<T, kBlockM, kBlockN, kHeadDim, kNWarps>;
+    auto flash_attention_func = flash_attention_v2<T, kBlockM, kBlockN, kHeadDim, kNWarps, IsCausal>;
     flash_attention_func<<<grid, block>>>(params);
     CUDA_ERROR_CHECK(cudaGetLastError());
 }
