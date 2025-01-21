@@ -247,8 +247,12 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
     // 3. smem to reg 的定义，需要：
     // 单线程负责的 smem tiled Tensor
     // 单线程负责的 reg Tensor
-    using MMA_Atom_Arch = MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>;
-    using MMA_Atom_Shape = MMA_Atom_Arch::Shape_MNK;
+    using MMA_Atom_Arch = std::conditional_t<
+        std::is_same_v<T, cutlass::half_t>,
+        MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
+        MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>
+    >;
+    using MMA_Atom_Shape = typename MMA_Atom_Arch::Shape_MNK;
     using MMA_Atom_M = decltype(get<0>(MMA_Atom_Shape{}));
     using MMA_Atom_N = decltype(get<1>(MMA_Atom_Shape{}));
     using MMA_Atom_K = decltype(get<2>(MMA_Atom_Shape{}));

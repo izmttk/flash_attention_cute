@@ -50,20 +50,22 @@ def benchmark(iter = 100):
     dim = 128
     is_causal = True
 
-    q = torch.randn((bs, num_heads_q, seqlen_q, dim), dtype=torch.half, device="cuda")
-    k = torch.randn((bs, num_heads_kv, seqlen_kv, dim), dtype=torch.half, device="cuda")
-    v = torch.randn((bs, num_heads_kv, seqlen_kv, dim), dtype=torch.half, device="cuda")
-    # q = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
-    # k = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
-    # v = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
+    dtype = torch.bfloat16
+
+    q = torch.randn((bs, num_heads_q, seqlen_q, dim), dtype=dtype, device="cuda")
+    k = torch.randn((bs, num_heads_kv, seqlen_kv, dim), dtype=dtype, device="cuda")
+    v = torch.randn((bs, num_heads_kv, seqlen_kv, dim), dtype=dtype, device="cuda")
+    # q = torch.ones((bs, num_heads, seq_len, dim), dtype=dtype, device="cuda")
+    # k = torch.ones((bs, num_heads, seq_len, dim), dtype=dtype, device="cuda")
+    # v = torch.ones((bs, num_heads, seq_len, dim), dtype=dtype, device="cuda")
     # for i in range(v.size(-1)):
     #     v[:, :, :, i] = i
-    # q = torch.arange(0, bs * num_heads * seq_len * dim, dtype=torch.half, device="cuda").reshape(bs, num_heads, seq_len, dim)
-    # k = torch.arange(0, bs * num_heads * seq_len * dim, dtype=torch.half, device="cuda").reshape(bs, num_heads, seq_len, dim)
-    # v = torch.arange(0, bs * num_heads * seq_len * dim, dtype=torch.half, device="cuda").reshape(bs, num_heads, seq_len, dim)
-    # q = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda")
-    # k = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda") * 2
-    # v = torch.ones((bs, num_heads, seq_len, dim), dtype=torch.half, device="cuda") * 3
+    # q = torch.arange(0, bs * num_heads * seq_len * dim, dtype=dtype, device="cuda").reshape(bs, num_heads, seq_len, dim)
+    # k = torch.arange(0, bs * num_heads * seq_len * dim, dtype=dtype, device="cuda").reshape(bs, num_heads, seq_len, dim)
+    # v = torch.arange(0, bs * num_heads * seq_len * dim, dtype=dtype, device="cuda").reshape(bs, num_heads, seq_len, dim)
+    # q = torch.ones((bs, num_heads, seq_len, dim), dtype=dtype, device="cuda")
+    # k = torch.ones((bs, num_heads, seq_len, dim), dtype=dtype, device="cuda") * 2
+    # v = torch.ones((bs, num_heads, seq_len, dim), dtype=dtype, device="cuda") * 3
 
     print("Benchmarking...")
     print("Q:", q.size(), q.stride())

@@ -25,6 +25,7 @@ def load_extension():
         sources=[
             str(CSRC / "flash_attention_api.cpp"),
             str(CSRC / "flash_attention_hdim128_fp16.cu"),
+            str(CSRC / "flash_attention_hdim128_bf16.cu"),
         ],
         extra_cflags=cflags,
         extra_cuda_cflags=[

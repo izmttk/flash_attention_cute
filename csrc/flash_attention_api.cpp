@@ -27,6 +27,8 @@ template <class Callback>
 void dtype_dispatch(torch::ScalarType dtype, Callback func) {
     if (dtype == torch::kHalf) {
         func(ConstantType<cutlass::half_t>{});
+    } else if (dtype == torch::kBFloat16) {
+        func(ConstantType<cutlass::bfloat16_t>{});
     }
 }
 
@@ -52,8 +54,8 @@ torch::Tensor flash_attention_fwd(
     // Check input data type
     TORCH_CHECK(q.dtype() == k.dtype() && q.dtype() == v.dtype(),
                 "q, k, v must have the same data type");
-    TORCH_CHECK(q.dtype() == torch::kHalf,
-                "q, k, v only support fp16 data type");
+    TORCH_CHECK(q.dtype() == torch::kHalf || q.dtype() == torch::kBFloat16,
+                "q, k, v only support fp16 or bf16 data type");
 
     // Check input memory contiguity
     TORCH_CHECK(q.stride(3) == 1,
