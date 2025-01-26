@@ -5,6 +5,7 @@
 #include "flash_attention.h"
 #include "mask.cuh"
 #include <cute/tensor.hpp>
+#include <cfloat>
 
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>

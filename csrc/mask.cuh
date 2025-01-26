@@ -1,5 +1,6 @@
 #pragma once
 #include <cute/tensor.hpp>
+#include <cfloat>
 
 namespace flash_attention {
 
