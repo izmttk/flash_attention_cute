@@ -24,8 +24,7 @@ def load_extension():
         name="flash_attention_extension",
         sources=[
             str(CSRC / "flash_attention_api.cpp"),
-            str(CSRC / "flash_attention_hdim128_fp16.cu"),
-            str(CSRC / "flash_attention_hdim128_bf16.cu"),
+            str(CSRC / "flash_attention_impl.cu"),
         ],
         extra_cflags=cflags,
         extra_cuda_cflags=[
@@ -40,9 +39,9 @@ def load_extension():
             "-U__CUDA_NO_HALF_CONVERSIONS__",
             "-U__CUDA_NO_HALF2_OPERATORS__",
             
-            # "-U__CUDA_NO_BFLOAT16_OPERATORS__",
-            # "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-            # "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+            "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            "-U__CUDA_NO_BFLOAT162_OPERATORS__",
 
             # "-gencode=arch=compute_80,code=sm_80",
         ],

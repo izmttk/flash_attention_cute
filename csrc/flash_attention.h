@@ -1,5 +1,4 @@
 #pragma once
-#include <cuda.h>
 
 namespace flash_attention {
 
@@ -37,18 +36,8 @@ struct FlashAttentionParams {
     float softmax_scale;
 };
 
+// Need to be implemented in flash_attention_impl.cu
 template <typename T, int kHeaddim, bool IsCausal>
-void run_flash_attention(FlashAttentionParams &params);
-
-#define CUDA_ERROR_CHECK(condition)                                            \
-  do {                                                                         \
-    cudaError_t error = condition;                                             \
-    if (error != cudaSuccess) {                                                \
-      printf("CUDA_CHECK error in line %d of file %s \
-              : %s \n",                                                        \
-             __LINE__, __FILE__, cudaGetErrorString(error));                   \
-      exit(EXIT_FAILURE);                                                      \
-    }                                                                          \
-  } while (0)
+void run_flash_attention(FlashAttentionParams &params, cudaStream_t stream);
 
 } // namespace flash_attention

@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include "flash_attention.h"
+#include "utils.h"
 #include "mask.cuh"
 #include <cute/tensor.hpp>
 #include <cfloat>
@@ -49,7 +50,6 @@ __forceinline__ __device__ void copy(
     DTensor& dst                    // (CPY, CPY_M, CPY_N)
 ) {
     using namespace cute;
-    // copy(tiled_copy, src, dst);
     // 不要轻易使用 cute::print 打印 Tensor，这玩意会引起包括 msialigned address,  illegal memory access 等一系列奇怪的问题
     // 仅限 Windows 平台，cutlass <= 3.6.0，其他平台未测试，有可能是 cutlass 的 bug，暂时没有头绪
     CUTE_UNROLL
@@ -137,7 +137,7 @@ CUTE_HOST_DEVICE constexpr auto convert_layout_partition_C_to_A(Layout const& c_
 // 同时在内存连续性上，只要求最后一维，即 head dim 连续即可，即 stride 为 1，其他的维度通过参数中的各自 stride 来控制
 template<typename T, int kBlockM, int kBlockN, int kHeadDim, int kNWarps, bool IsCausal>
 // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#grid-constant
-__global__ void flash_attention_v2(const FlashAttentionParams params) {
+__global__ void flash_attention_v2(__grid_constant__ const FlashAttentionParams params) {
     using namespace cute;
 
     constexpr int kNThreads = kNWarps * WARP_SIZE;
@@ -210,9 +210,11 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
     using SmemLayoutVt = decltype(tile_to_shape(SmemLayoutAtomTranspose{}, Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{}));
     using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtom{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
 
-    __shared__ T q_smem[cosize(SmemLayoutQ{})];
-    __shared__ T k_smem[cosize(SmemLayoutK{})];
-    __shared__ T v_smem[cosize(SmemLayoutV{})];
+    // alignas(T) 似乎不能放在 extern __shared__ 旁边
+    extern __shared__ unsigned char alignas(T) smem[];
+    T* q_smem = reinterpret_cast<T*>(smem);
+    T* k_smem = q_smem + cosize(SmemLayoutQ{});
+    T* v_smem = k_smem + cosize(SmemLayoutK{});
 
     Tensor sQ = make_tensor(make_smem_ptr(q_smem), SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(k_smem), SmemLayoutK{});
@@ -313,11 +315,13 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
     Tensor tOrVt_copy_view = smem_thr_copy_V.retile_D(tOrVt);
 
     copy(gmem_tiled_copy_QKV, tQcQ, make_tuple(params.seqlen_q - q_tile * kBlockM, params.headdim), tQgQ, tQsQ);
+    // copy(gmem_tiled_copy_QKV, tQgQ, tQsQ);
     // cp_async_fence();
     // cp_async_wait<0>();
     // __syncthreads();
 
     copy(gmem_tiled_copy_QKV, tKVcKV, make_tuple(params.seqlen_kv - 0 * kBlockN, params.headdim), tKgK(_, _, _, 0), tKsK);
+    // copy(gmem_tiled_copy_QKV, tKgK(_, _, _, 0), tKsK);
     cp_async_fence();
 
     clear(rAccO);
@@ -352,6 +356,7 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
 
         // 复制接下来将要用到的 V 到 smem
         copy(gmem_tiled_copy_QKV, tKVcKV, make_tuple(params.seqlen_kv - block * kBlockN, params.headdim), tVgV(_, _, _, block), tVsV);
+        // copy(gmem_tiled_copy_QKV, tVgV(_, _, _, block), tVsV);
         cp_async_fence();
 
         // S = Q * K^T
@@ -375,6 +380,7 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
         if (block != n_blocks - 1) {
             // 更新 gK tKgK 指向下一个 K block，并进行复制
             copy(gmem_tiled_copy_QKV, tKVcKV, make_tuple(params.seqlen_kv - (block + 1) * kBlockN, params.headdim), tKgK(_, _, _, block + 1), tKsK);
+            // copy(gmem_tiled_copy_QKV, tKgK(_, _, _, block + 1), tKsK);
             cp_async_fence();
         }
 
@@ -400,39 +406,84 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
         Tensor rS_2d = make_tensor(rAccS.data(), layout_rAccS_2d);
         Tensor rO_2d = make_tensor(rAccO.data(), layout_rAccO_2d);
 
+        // CUTE_UNROLL
+        // for (int row = 0; row < size<0>(rS_2d); row++) {
+        //     float& prev_rowmax = scores_max(row);
+        //     float new_rowmax = prev_rowmax;
+        //     CUTE_UNROLL
+        //     for (int col = 0; col < size<1>(rS_2d); col++) {
+        //         new_rowmax = fmaxf(new_rowmax, rS_2d(row, col));
+        //     }
+        //     constexpr int threads_col = 4;
+        //     new_rowmax = warp_reduce_max<float, threads_col>(new_rowmax);
+        //     // 因为求一行的最大值的时候，S没有进行缩放，所以这里要缩放一下
+        //     float scores_scale = exp2f((prev_rowmax - new_rowmax) * params.softmax_scale);
+        //     prev_rowmax = new_rowmax;
+
+        //     // 缩放 O
+        //     CUTE_UNROLL
+        //     for (int col = 0; col < size<1>(rO_2d); col++) {
+        //         rO_2d(row, col) *= scores_scale;
+        //     }
+
+        //     CUTE_UNROLL
+        //     for (int col = 0; col < size<1>(rS_2d); col++) {
+        //         float& s = rS_2d(row, col);
+        //         s = s == -FLT_MAX ? 0.0f : exp2f((s - new_rowmax) * params.softmax_scale);
+        //     }
+
+        //     float& prev_rowsum = scores_sum(row);
+        //     float new_rowsum = 0.0f;
+        //     CUTE_UNROLL
+        //     for (int col = 0; col < size<1>(rS_2d); col++) {
+        //         new_rowsum += rS_2d(row, col);
+        //     }
+        //     new_rowsum = warp_reduce_sum<float, threads_col>(new_rowsum);
+        //     prev_rowsum = scores_scale * prev_rowsum + new_rowsum;
+        // }
+
+        Tensor scores_max_prev = make_tensor_like(scores_max);
+        copy(scores_max, scores_max_prev);
         CUTE_UNROLL
         for (int row = 0; row < size<0>(rS_2d); row++) {
-            float& prev_rowmax = scores_max(row);
-            float new_rowmax = prev_rowmax;
             CUTE_UNROLL
             for (int col = 0; col < size<1>(rS_2d); col++) {
-                new_rowmax = max(new_rowmax, rS_2d(row, col));
+                scores_max(row) = fmaxf(scores_max(row), rS_2d(row, col));
             }
-            constexpr int threads_col = 4;
-            new_rowmax = warp_reduce_max<float, threads_col>(new_rowmax);
-            // 因为求一行的最大值的时候，S没有进行缩放，所以这里要缩放一下
-            float scores_scale = exp2f((prev_rowmax - new_rowmax) * params.softmax_scale);
-            prev_rowmax = new_rowmax;
+        }
+        CUTE_UNROLL
+        for (int row = 0; row < size(scores_max); row++) {
+            scores_max(row) = warp_reduce_max<float, 4>(scores_max(row));
+        }
 
-            // 缩放 O
+
+        CUTE_UNROLL
+        for (int row = 0; row < size<0>(rO_2d); row++) {
+            float scores_scale = exp2f((scores_max_prev(row) - scores_max(row)) * params.softmax_scale);
+            scores_sum(row) *= scores_scale;
             CUTE_UNROLL
             for (int col = 0; col < size<1>(rO_2d); col++) {
                 rO_2d(row, col) *= scores_scale;
             }
+        }
 
+
+        CUTE_UNROLL
+        for (int row = 0; row < size<0>(rS_2d); row++) {
+            float max_scaled = scores_max(row) * params.softmax_scale;
             CUTE_UNROLL
             for (int col = 0; col < size<1>(rS_2d); col++) {
-                rS_2d(row, col) = rS_2d(row, col) == -FLT_MAX ? 0.0f : exp2f((rS_2d(row, col) - new_rowmax) * params.softmax_scale);
+                rS_2d(row, col) = exp2f(rS_2d(row, col) * params.softmax_scale - max_scaled);
             }
+        }
 
-            float& prev_rowsum = scores_sum(row);
-            float new_rowsum = 0.0f;
+
+        CUTE_UNROLL
+        for (int row = 0; row < size<0>(rS_2d); row++) {
             CUTE_UNROLL
             for (int col = 0; col < size<1>(rS_2d); col++) {
-                new_rowsum += rS_2d(row, col);
+                scores_sum(row) += rS_2d(row, col);
             }
-            new_rowsum = warp_reduce_sum<float, threads_col>(new_rowsum);
-            prev_rowsum = scores_scale * prev_rowsum + new_rowsum;
         }
 
         // O = S * V
@@ -462,7 +513,10 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
             gemm(tiled_mma, tOrP(_, _, sub_block), tOrVt(_, _, sub_block), rAccO);
         }
     }
-
+    CUTE_UNROLL
+    for (int row = 0; row < size(scores_sum); row++) {
+        scores_sum(row) = warp_reduce_sum<float, 4>(scores_sum(row));
+    }
     Tensor rO_2d = make_tensor(rAccO.data(), layout_rAccO_2d);
     CUTE_UNROLL
     for (int row = 0; row < size<0>(rO_2d); row++) {
@@ -500,21 +554,31 @@ __global__ void flash_attention_v2(const FlashAttentionParams params) {
     Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
     __syncthreads();
 
+    // Tensor tOrO = make_fragment_like(tOgO);
+    // copy(gmem_tiled_copy_O, tOsO, tOrO);
     Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
 
     // 最后复制 O 到 gmem 时，要关闭 IsClearOOB，因为 mO 的尺寸不一定等于 gO，会有值被覆盖为 0 的情况
     copy<false>(gmem_tiled_copy_O, tOcO, make_tuple(params.seqlen_q - q_tile * kBlockM, params.headdim), tOsO, tOgO);
+    // copy(gmem_tiled_copy_O, tOrO, tOgO);
 }
 
 
 template <typename T, int kBlockM, int kBlockN, int kHeadDim, int kNWarps, bool IsCausal>
-void launch_flash_attention(FlashAttentionParams &params) {
+void launch_flash_attention(FlashAttentionParams &params, cudaStream_t stream) {
     constexpr int kNThreads = kNWarps * WARP_SIZE;
     int num_q_tiles = cute::ceil_div(params.seqlen_q, kBlockM);
     dim3 grid(num_q_tiles, params.num_heads_q, params.batch_size);
     dim3 block(kNThreads);
     auto flash_attention_func = flash_attention_v2<T, kBlockM, kBlockN, kHeadDim, kNWarps, IsCausal>;
-    flash_attention_func<<<grid, block>>>(params);
+
+    constexpr int smem_size = (kBlockM * kHeadDim + kBlockN * kHeadDim * 2) * sizeof(T);
+    
+    // CUDA 默认 max_shared_memory_per_block 为 48KB，这里改变了 smem 的比例
+    // 要使用大于 48 KB 的共享内存，必须动态分配共享内存
+    CUDA_ERROR_CHECK(cudaFuncSetAttribute(flash_attention_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+    flash_attention_func<<<grid, block, smem_size, stream>>>(params);
     CUDA_ERROR_CHECK(cudaGetLastError());
 }
 

@@ -13,12 +13,12 @@ template <typename T, T val>
 struct ValueWrapper { static constexpr T value = val; };
 
 
-void fallback_no_impl() {
+inline void fallback_no_impl() {
     TORCH_CHECK(false, "No suitable implementation for flash attention kernel.");
 }
 
 template <typename NextDispatcher>
-void type_dispatcher(torch::ScalarType type, NextDispatcher&& next_dispatcher) {
+inline void type_dispatcher(torch::ScalarType type, NextDispatcher&& next_dispatcher) {
     switch (type)
     {
     case torch::kHalf:
@@ -34,7 +34,7 @@ void type_dispatcher(torch::ScalarType type, NextDispatcher&& next_dispatcher) {
 }
 
 template <typename NextDispatcher>
-void bool_dispatcher(bool flag, NextDispatcher&& next_dispatcher) {
+inline void bool_dispatcher(bool flag, NextDispatcher&& next_dispatcher) {
     if (flag) {
         next_dispatcher(ValueWrapper<bool, true>{});
     } else {
@@ -43,7 +43,7 @@ void bool_dispatcher(bool flag, NextDispatcher&& next_dispatcher) {
 }
 
 template <typename NextDispatcher>
-void headdim_dispatcher(int64_t headdim, NextDispatcher&& next_dispatcher) {
+inline void headdim_dispatcher(int64_t headdim, NextDispatcher&& next_dispatcher) {
     if (headdim <= 128 ) {
         next_dispatcher(ValueWrapper<int64_t, 128>{});
     } else {
@@ -51,4 +51,4 @@ void headdim_dispatcher(int64_t headdim, NextDispatcher&& next_dispatcher) {
     }
 }
 
-}  // namespace flash_attention
+} // namespace flash_attention

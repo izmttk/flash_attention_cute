@@ -1,13 +1,21 @@
 #include <torch/extension.h>
 #include <torch/types.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cutlass/numeric_types.h>
 #include "flash_attention.h"
+#include "utils.h"
 #include "kernel_dispatcher.h"
 
 namespace flash_attention {
 
+extern void run_flash_attention(FlashAttentionParams &params);
+
 torch::Tensor flash_attention_fwd(
     torch::Tensor &q, torch::Tensor &k, torch::Tensor &v, float softmax_scale, bool causal) {
+    // Check environment
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    TORCH_CHECK(cc_major >= 8,
+                "flash attention is only supported on devices of cc >= 8.0");
 
     // Check input shape
     TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0),
@@ -68,7 +76,7 @@ torch::Tensor flash_attention_fwd(
         q = q.reshape({bs, head_q, seqlen_q, headdim});
     }
 
-    auto o = torch::empty({bs, head_q, seqlen_q, headdim}, q.options());
+    auto o = torch::empty_like(q);
 
     softmax_scale *= M_LOG2E;
     FlashAttentionParams params = {
@@ -98,13 +106,15 @@ torch::Tensor flash_attention_fwd(
         softmax_scale
     };
 
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+
     type_dispatcher(q.scalar_type(), [&](auto type_wrapper) {
         headdim_dispatcher(headdim, [&](auto headdim_wrapper) {
             bool_dispatcher(causal, [&](auto causal_wrapper) {
                 using kDtype = typename decltype(type_wrapper)::type;
                 constexpr auto kHeaddim = decltype(headdim_wrapper)::value;
                 constexpr auto IsCausal = decltype(causal_wrapper)::value;
-                run_flash_attention<kDtype, kHeaddim, IsCausal>(params);
+                run_flash_attention<kDtype, kHeaddim, IsCausal>(params, stream);
             });
         });
     });
