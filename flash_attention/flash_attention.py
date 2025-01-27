@@ -29,9 +29,9 @@ def flash_attention_forward_cuda(q: torch.Tensor, k: torch.Tensor, v: torch.Tens
         q = torch.nn.functional.pad(q, [0, 8 - head_dim % 8])
         k = torch.nn.functional.pad(k, [0, 8 - head_dim % 8])
         v = torch.nn.functional.pad(v, [0, 8 - head_dim % 8])
-    q = q.contiguous() if q.stride(3) != -1 else q
-    k = k.contiguous() if k.stride(3) != -1 else k
-    v = v.contiguous() if v.stride(3) != -1 else v
+    q = q.contiguous() if q.stride(3) != 1 else q
+    k = k.contiguous() if k.stride(3) != 1 else k
+    v = v.contiguous() if v.stride(3) != 1 else v
     attn = flash_attention_cuda.flash_attention_fwd(q, k, v, softmax_scale, causal)
     if need_padding:
         attn = attn[:, :, :, :head_dim]
