@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <torch/types.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cutlass/numeric_types.h>
 #include "flash_attention.h"
 #include "utils.h"
@@ -54,6 +55,11 @@ torch::Tensor flash_attention_fwd(
                 "only support hidden dimension <= 128");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
                 "q, k, v must be on CUDA device");
+    TORCH_CHECK(q.device() == k.device() && q.device() == v.device(),
+                "q, k, v must be on the same CUDA device");
+
+    // RAII 机制切换 device，使用 cudaSetDevice()
+    at::cuda::CUDAGuard device_guard{q.device()};
 
     int64_t bs = q.size(0);
     int64_t head_q = q.size(1);
