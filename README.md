@@ -15,6 +15,7 @@
 - [x] 实现 GQA 下 合并同组 q head，以降低冗余 TensorCore 计算
 - [x] 实现 python 调用 和 pytorch 自定义算子集成
 - [x] 实现 llm 注意力机制集成
+- [ ] 支持 varlen
 - [ ] 优化 mask 性能
 - [ ] 实现 splitkv 算子（Flash Decoding）
 - [ ] 实现 paged kv cache（Paged Attention）
